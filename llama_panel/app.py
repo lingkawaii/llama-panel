@@ -9,7 +9,7 @@ from urllib.parse import urlparse
 
 from flask import Flask, jsonify, request, send_from_directory
 
-from .client import LlamaClient
+from .client import LlamaClient, parse_model_state
 from .gpu import get_gpu_stats
 from .process import ServerProcess, find_pid_on_port, kill_pid
 
@@ -132,20 +132,67 @@ def create_app(
 
     @app.get("/api/status")
     def api_status():
+        models = client.models()
+        ms = parse_model_state(models)
+        # Router 模式防误唤醒：仅 loaded 时才能请求 /slots 与 /metrics，
+        # unloaded 状态下请求它们会触发 --models-autoload 误唤醒模型。
+        if ms["router_mode"]:
+            if ms["state"] == "loaded" and ms["model_id"]:
+                slots = client.slots(ms["model_id"])
+                metrics = client.metrics(ms["model_id"])
+            else:
+                slots, metrics = [], None
+        else:
+            slots = client.slots()
+            metrics = client.metrics()
         return jsonify(
             {
                 "ts": time.time(),
                 "server": {
                     "base_url": server_url,
                     "health": client.health(),
-                    "models": client.models(),
+                    "models": models,
+                    "model_state": ms,
                     "process": _process_info(),
                 },
-                "slots": client.slots(),
-                "metrics": client.metrics(),
+                "slots": slots,
+                "metrics": metrics,
                 "gpu": get_gpu_stats(),
             }
         )
+
+    def _model_id_from_body() -> str | None:
+        data = request.get_json(silent=True)
+        if isinstance(data, dict):
+            model = data.get("model")
+            if isinstance(model, str) and model:
+                return model
+        return None
+
+    def _resolve_model() -> str | None:
+        """body 指定 model 优先；缺省时取当前 /v1/models 的 model_id。"""
+        model = _model_id_from_body()
+        if model:
+            return model
+        return parse_model_state(client.models()).get("model_id")
+
+    @app.post("/api/model/load")
+    def api_model_load():
+        """Router 模式手动加载模型（唤醒）。body 可选 {"model": "..."}。"""
+        model = _resolve_model()
+        if not model:
+            return jsonify({"ok": False, "error": "未指定 model，且当前无法从 /v1/models 获取 model_id"}), 400
+        result = client.load_model(model)
+        return jsonify(result), (200 if result.get("ok") else 502)
+
+    @app.post("/api/model/unload")
+    def api_model_unload():
+        """Router 模式手动卸载模型释放显存。body 可选 {"model": "..."}。"""
+        model = _resolve_model()
+        if not model:
+            return jsonify({"ok": False, "error": "未指定 model，且当前无法从 /v1/models 获取 model_id"}), 400
+        result = client.unload_model(model)
+        return jsonify(result), (200 if result.get("ok") else 502)
 
     @app.get("/api/logs")
     def api_logs():

@@ -38,6 +38,26 @@ def post_raw(path):
         return e.code, json.loads(e.read())
 
 
+def post_json(path, obj):
+    """POST JSON body，返回 (状态码, JSON 体)；非 2xx 不抛异常。"""
+    req = urllib.request.Request(
+        f"http://127.0.0.1:{PANEL_PORT}{path}",
+        data=json.dumps(obj).encode(),
+        headers={"Content-Type": "application/json"}, method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=25) as r:
+            return r.status, json.loads(r.read())
+    except urllib.error.HTTPError as e:
+        return e.code, json.loads(e.read())
+
+
+def fake_get(path):
+    """直接请求 fake server（绕过面板），用于读取 /debug 等测试钩子。"""
+    with urllib.request.urlopen(f"http://127.0.0.1:{FAKE_PORT}{path}", timeout=10) as r:
+        return json.loads(r.read())
+
+
 def wait_status(predicate, what, timeout=40):
     deadline = time.time() + timeout
     last = None
@@ -215,9 +235,178 @@ def test_probe_down():
     print("probe down:", status, d)
 
 
+def test_parse_model_state():
+    """纯函数单测：parse_model_state（Router 模式感知）。"""
+    from llama_panel.client import parse_model_state
+
+    # None / 空 → 非 Router、无模型
+    assert parse_model_state(None) == {
+        "router_mode": False, "model_id": None, "state": "none",
+        "sleep_idle_seconds": None,
+    }
+    assert parse_model_state({})["state"] == "none"
+    assert parse_model_state({"data": []})["state"] == "none"
+
+    # 非 Router 单模型：有 model_id → loaded
+    assert parse_model_state({"data": [{"id": "fake-model"}]}) == {
+        "router_mode": False, "model_id": "fake-model",
+        "state": "loaded", "sleep_idle_seconds": None,
+    }
+
+    # Router 模式：value/args 解析
+    payload = {"data": [{
+        "id": "qwen3.8-27b",
+        "status": {
+            "value": "loaded",
+            "args": ["--models-preset", "m.ini", "--models-autoload",
+                     "--sleep-idle-seconds", "600"],
+            "preset": "m.ini",
+        },
+        "meta": {"n_ctx": 32768},
+    }]}
+    r = parse_model_state(payload)
+    assert r["router_mode"] is True
+    assert r["model_id"] == "qwen3.8-27b"
+    assert r["state"] == "loaded"
+    assert r["sleep_idle_seconds"] == 600
+
+    # unloaded / loading 状态（无 meta）
+    payload["data"][0]["status"]["value"] = "unloaded"
+    del payload["data"][0]["meta"]
+    assert parse_model_state(payload)["state"] == "unloaded"
+    payload["data"][0]["status"]["value"] = "loading"
+    assert parse_model_state(payload)["state"] == "loading"
+
+    # sleep_idle_seconds：preset 文本正则解析
+    payload["data"][0]["status"]["args"] = []
+    payload["data"][0]["status"]["preset"] = "m.ini (sleep-idle-seconds = 1200)"
+    assert parse_model_state(payload)["sleep_idle_seconds"] == 1200
+
+    # sleep_idle_seconds：未配置 / <= 0 / 缺值 / 非数字 → None
+    status = payload["data"][0]["status"]
+    status["args"] = ["--sleep-idle-seconds", "0"]
+    status["preset"] = "m.ini"
+    assert parse_model_state(payload)["sleep_idle_seconds"] is None
+    status["args"] = ["--sleep-idle-seconds"]
+    assert parse_model_state(payload)["sleep_idle_seconds"] is None
+    status["args"] = ["--sleep-idle-seconds", "abc"]
+    assert parse_model_state(payload)["sleep_idle_seconds"] is None
+    status["args"] = ["--other", "5"]
+    assert parse_model_state(payload)["sleep_idle_seconds"] is None
+
+    # status 非 dict / 缺 value → 非 Router
+    assert parse_model_state({"data": [{"id": "a", "status": "loaded"}]})["router_mode"] is False
+    assert parse_model_state({"data": [{"id": "a", "status": {}}]})["router_mode"] is False
+    assert parse_model_state({"data": [{"status": {"value": "loaded"}}]}) == {
+        "router_mode": True, "model_id": None, "state": "loaded",
+        "sleep_idle_seconds": None,
+    }
+    print("A) parse_model_state 单测通过")
+
+
+def test_model_routes():
+    """单测：/api/model/load|unload 无 model_id 返回 400，上游失败返回 502。"""
+    from llama_panel.app import create_app
+    from llama_panel.client import LlamaClient
+
+    orig = (LlamaClient.models, LlamaClient.load_model, LlamaClient.unload_model)
+    try:
+        LlamaClient.models = lambda self: {"data": []}
+        LlamaClient.load_model = lambda self, model, timeout=30.0: {"ok": True, "model": model}
+        LlamaClient.unload_model = lambda self, model, timeout=15.0: {"ok": True, "model": model}
+        app = create_app("http://127.0.0.1:9", ["fake"],
+                         log_path=os.path.join(HERE, "test_model_routes.log"))
+        c = app.test_client()
+
+        # 无 body 且无 model_id → 400
+        r = c.post("/api/model/load")
+        assert r.status_code == 400, f"无 model_id 应 400: {r.status_code} {r.get_json()}"
+        r = c.post("/api/model/unload")
+        assert r.status_code == 400, f"无 model_id 应 400: {r.status_code} {r.get_json()}"
+
+        # body 指定 model → 200
+        r = c.post("/api/model/load", json={"model": "x"})
+        assert r.status_code == 200 and r.get_json() == {"ok": True, "model": "x"}
+        r = c.post("/api/model/unload", json={"model": "x"})
+        assert r.status_code == 200 and r.get_json() == {"ok": True, "model": "x"}
+
+        # 上游失败 → 502
+        LlamaClient.models = lambda self: {"data": [{"id": "x"}]}
+        LlamaClient.load_model = lambda self, model, timeout=30.0: {"ok": False, "error": "boom"}
+        r = c.post("/api/model/load")
+        assert r.status_code == 502 and r.get_json()["ok"] is False
+        LlamaClient.unload_model = lambda self, model, timeout=15.0: {"ok": False, "error": "boom"}
+        r = c.post("/api/model/unload")
+        assert r.status_code == 502 and r.get_json()["ok"] is False
+    finally:
+        LlamaClient.models, LlamaClient.load_model, LlamaClient.unload_model = orig
+    print("B) model load/unload 路由单测通过")
+
+
+def test_router_e2e():
+    """Router 模式端到端：unloaded 不误唤醒，load/unload API 可用。"""
+    # 9) 启动 --router 模式 fake server（初始状态 unloaded）
+    if os.path.exists(PID_FILE):
+        os.remove(PID_FILE)
+    fake_log = open(os.path.join(HERE, "test_fake.log"), "ab")
+    fake2 = subprocess.Popen([PY, "fake_llama.py", "--router"], cwd=HERE,
+                             stdout=fake_log, stderr=fake_log)
+    router_pid = wait_pid_file(what="router fake pid")
+    print("9) router fake server 已启动, real pid:", router_pid)
+
+    # 9a) unloaded：/api/status 必须返回 slots=[] metrics=None
+    s = wait_status(
+        lambda d: (d["server"].get("model_state") or {}).get("router_mode") is True
+        and (d["server"].get("model_state") or {}).get("state") == "unloaded",
+        "router unloaded status",
+    )
+    ms = s["server"]["model_state"]
+    assert ms["model_id"] == "qwen3.8-27b", ms
+    assert ms["sleep_idle_seconds"] == 600, ms
+    assert s["slots"] == [], f"unloaded 不应请求 /slots: {s['slots']}"
+    assert s["metrics"] is None, f"unloaded 不应请求 /metrics: {s['metrics']}"
+    print("9a) unloaded status ok:", ms)
+
+    # 9b) 多次轮询确认绝不误触发 autoload
+    for _ in range(3):
+        get("/api/status")
+        time.sleep(0.2)
+    dbg = fake_get("/debug")
+    assert dbg["state"] == "unloaded", f"unloaded 被误唤醒: {dbg}"
+    assert dbg["slots_misfires"] == 0 and dbg["metrics_misfires"] == 0, f"误触发 autoload: {dbg}"
+    print("9b) 无误唤醒:", dbg)
+
+    # 9c) POST /api/model/load（无 body，自动取 model_id）→ 200，随后 loaded
+    code, d = post_raw("/api/model/load")
+    assert code == 200 and d.get("ok") is True, f"load 应成功: {code} {d}"
+    s = wait_status(
+        lambda d: (d["server"].get("model_state") or {}).get("state") == "loaded",
+        "router loaded",
+    )
+    assert s["slots"], f"loaded 应返回 slots: {s['slots']}"
+    assert s["metrics"], f"loaded 应返回 metrics: {s['metrics']}"
+    assert fake_get("/debug")["state"] == "loaded"
+    print("9c) loaded ok:", s["server"]["model_state"])
+
+    # 9d) POST /api/model/unload → 200，回到 unloaded
+    code, d = post_raw("/api/model/unload")
+    assert code == 200 and d.get("ok") is True, f"unload 应成功: {code} {d}"
+    s = wait_status(
+        lambda d: (d["server"].get("model_state") or {}).get("state") == "unloaded",
+        "router unloaded after unload",
+    )
+    assert s["slots"] == [] and s["metrics"] is None, s
+    dbg = fake_get("/debug")
+    assert dbg["state"] == "unloaded", dbg
+    print("9d) unloaded ok:", dbg)
+    return fake2
+
+
 def main():
     test_gpu_parsers()
     test_parse_systemd_uptime()
+    test_parse_model_state()
+    test_model_routes()
 
     for p in (FAKE_PORT, PANEL_PORT):
         assert not port_in_use(p), f"端口 {p} 已被占用，先清理残留进程"
@@ -231,6 +420,7 @@ def main():
         [PY, "main.py", "--port", str(PANEL_PORT),
          "--server-cmd", f"{PY} fake_llama.py"],
         cwd=HERE, stdout=panel_log, stderr=panel_log)
+    fake2 = None
     try:
         # 0) 假 server 的真实 pid（本环境 Popen.pid 可能与子进程实际 pid 不同）
         deadline = time.time() + 10
@@ -325,9 +515,14 @@ def main():
         # 8b) server 停止后测速应 502
         test_probe_down()
 
+        # 9) Router 模式端到端
+        fake2 = test_router_e2e()
+
         print("\nALL E2E CHECKS PASSED")
     finally:
-        for proc in (panel, fake):
+        for proc in (panel, fake2, fake):
+            if proc is None:
+                continue
             try:
                 proc.kill()
                 proc.wait(timeout=5)

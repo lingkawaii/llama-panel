@@ -40,6 +40,64 @@ def parse_prometheus(text: str) -> dict[str, float]:
     return out
 
 
+_SLEEP_ARG_RE = re.compile(r"sleep-idle-seconds\s*=\s*(\d+)")
+
+
+def _sleep_idle_seconds(status: dict) -> int | None:
+    """从 Router 模式 status 中解析 --sleep-idle-seconds 秒数。
+
+    优先取 args 列表（"--sleep-idle-seconds" 的下一项），
+    否则在 preset 文本中正则匹配；未配置或 <= 0 返回 None。
+    """
+    args = status.get("args")
+    if isinstance(args, list):
+        for i, a in enumerate(args):
+            if a == "--sleep-idle-seconds" and i + 1 < len(args):
+                try:
+                    v = int(str(args[i + 1]).strip())
+                except (TypeError, ValueError):
+                    return None
+                return v if v > 0 else None
+    preset = status.get("preset")
+    if isinstance(preset, str):
+        m = _SLEEP_ARG_RE.search(preset)
+        if m:
+            v = int(m.group(1))
+            return v if v > 0 else None
+    return None
+
+
+def parse_model_state(models_payload: dict | None) -> dict:
+    """从 GET /v1/models 响应解析模型状态（Router 模式感知）。
+
+    返回 {"router_mode": bool, "model_id": str | None,
+          "state": str, "sleep_idle_seconds": int | None}
+
+    - router_mode: data[0].status 是含 "value" 的 dict（Router 模式特征）
+    - state: Router 模式取 status["value"]（loaded/unloaded/loading）；
+      非 Router 单模型模式有 model_id 则为 "loaded"，否则 "none"
+    - sleep_idle_seconds: 仅 Router 模式从 status 解析，未配置为 None
+    """
+    data = models_payload.get("data") if isinstance(models_payload, dict) else None
+    first = data[0] if isinstance(data, list) and data and isinstance(data[0], dict) else {}
+    model_id = first.get("id")
+    status = first.get("status")
+    router_mode = isinstance(status, dict) and "value" in status
+    if router_mode:
+        value = status.get("value")
+        state = value if isinstance(value, str) and value else "unknown"
+        sleep_idle = _sleep_idle_seconds(status)
+    else:
+        state = "loaded" if model_id else "none"
+        sleep_idle = None
+    return {
+        "router_mode": router_mode,
+        "model_id": model_id,
+        "state": state,
+        "sleep_idle_seconds": sleep_idle,
+    }
+
+
 class LlamaClient:
     """对 llama-server 的只读查询封装。所有方法在失败时返回 None/[] 而非抛异常。"""
 
@@ -48,8 +106,8 @@ class LlamaClient:
         self.timeout = timeout
         self._session = requests.Session()
 
-    def _get(self, path: str):
-        return self._session.get(self.base_url + path, timeout=self.timeout)
+    def _get(self, path: str, params: dict | None = None):
+        return self._session.get(self.base_url + path, params=params, timeout=self.timeout)
 
     def health(self) -> dict | None:
         try:
@@ -120,23 +178,57 @@ class LlamaClient:
             "spec_accept_percent": spec,
         }
 
-    def slots(self) -> list[dict]:
-        """GET /slots，返回槽位状态列表（服务端 --no-slots 时为空）。"""
+    def slots(self, model: str | None = None) -> list[dict]:
+        """GET /slots，返回槽位状态列表（服务端 --no-slots 时为空）。
+
+        Router 模式必须带 model 参数，否则服务端返回 400。
+        """
+        params = {"model": model} if model else None
         try:
-            r = self._get("/slots")
+            r = self._get("/slots", params=params)
             r.raise_for_status()
             data = r.json()
             return data if isinstance(data, list) else []
         except (requests.RequestException, ValueError):
             return []
 
-    def metrics(self) -> dict[str, float] | None:
-        """GET /metrics。服务端未开 --metrics 时返回 None（HTTP 501）。"""
+    def metrics(self, model: str | None = None) -> dict[str, float] | None:
+        """GET /metrics。服务端未开 --metrics 时返回 None（HTTP 501）。
+
+        Router 模式必须带 model 参数，否则服务端返回 400。
+        """
+        params = {"model": model} if model else None
         try:
-            r = self._get("/metrics")
+            r = self._get("/metrics", params=params)
             if r.status_code == 501:
                 return None
             r.raise_for_status()
             return parse_prometheus(r.text)
         except requests.RequestException:
             return None
+
+    def load_model(self, model: str, timeout: float = 30.0) -> dict:
+        """POST /models/load，Router 模式手动加载模型（唤醒）。
+
+        成功: {"ok": True, "model": model}
+        失败: {"ok": False, "error": "..."}
+        """
+        return self._model_action("/models/load", model, timeout)
+
+    def unload_model(self, model: str, timeout: float = 15.0) -> dict:
+        """POST /models/unload，Router 模式手动卸载模型释放显存。
+
+        成功: {"ok": True, "model": model}
+        失败: {"ok": False, "error": "..."}
+        """
+        return self._model_action("/models/unload", model, timeout)
+
+    def _model_action(self, path: str, model: str, timeout: float) -> dict:
+        try:
+            r = self._session.post(
+                self.base_url + path, json={"model": model}, timeout=timeout
+            )
+            r.raise_for_status()
+            return {"ok": True, "model": model}
+        except requests.RequestException as e:
+            return {"ok": False, "error": f"请求失败: {e}"}
