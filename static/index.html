@@ -118,7 +118,8 @@ function fmt(v, unit = "") {
   if (v === null || v === undefined) return "—";
   if (typeof v === "number") {
     const n = Math.abs(v) >= 1000 ? v.toLocaleString(undefined, {maximumFractionDigits: 0})
-                                   : v.toFixed(2);
+              : Number.isInteger(v) ? v.toLocaleString()
+              : v.toFixed(2);
     return n + unit;
   }
   return String(v);
