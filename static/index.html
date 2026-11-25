@@ -132,6 +132,20 @@ function fmtUptime(s) {
   return h ? `${h}h ${m}m` : m ? `${m}m ${Math.floor(s % 60)}s` : `${Math.floor(s)}s`;
 }
 
+function fmtBig(n) {
+  if (n === null || n === undefined) return null;
+  if (n >= 1e9) return (n / 1e9).toFixed(1) + "B";
+  if (n >= 1e6) return (n / 1e6).toFixed(1) + "M";
+  return String(n);
+}
+
+function fmtBytes(n) {
+  if (n === null || n === undefined) return null;
+  if (n >= 1e9) return (n / 1e9).toFixed(1) + " GB";
+  if (n >= 1e6) return (n / 1e6).toFixed(1) + " MB";
+  return String(n) + " B";
+}
+
 function modelId(models) {
   const d = models?.data;
   return Array.isArray(d) && d.length ? d[0].id : null;
@@ -155,9 +169,15 @@ function renderStatus(data) {
   // 模型
   const mid = modelId(s.models);
   const meta = s.models?.data?.[0]?.meta || {};
+  const subs = [
+    `n_ctx ${fmt(meta.n_ctx)}`,
+    meta.ftype || null,
+    meta.n_params ? `${fmtBig(meta.n_params)} 参数` : null,
+    meta.size ? fmtBytes(meta.size) : null,
+  ].filter(Boolean);
   $("model-card").innerHTML = mid
     ? `<div class="label">模型</div><div class="value" style="font-size:16px">${mid}</div>
-       <div class="sub">n_ctx ${fmt(meta.n_ctx)} · 架构 ${meta.architecture || "?"}</div>`
+       <div class="sub">${subs.join(" · ")}</div>`
     : `<span class="muted">无模型信息（服务未启动或未加载模型）</span>`;
 
   // 指标卡
