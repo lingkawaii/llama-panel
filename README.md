@@ -5,13 +5,16 @@
 ## 功能
 
 - **服务控制**：启动 / 停止 / 重启 llama-server 子进程，显示 PID 与运行时长，日志落盘到 `llama-server.log`；停止/重启需二次确认，请求进行中按钮自动禁用
-- **systemd 托管**：`--systemd-unit` 指定 systemd 单元后，状态查询与启停/重启全部走 `systemctl`（非 root 无免密权限时返回 500 + 明确错误）
+- **systemd 托管**：`--systemd-unit` 指定 systemd 单元后，状态查询与启停/重启全部走 `systemctl`（非 root 无免密权限时返回 500 + 明确错误）；运行时长取自 `ActiveEnterTimestampMonotonic`（单调时钟，真实 uptime）
 - **模型信息**：来自 `GET /v1/models`（模型 ID、架构、上下文长度）
 - **显卡 / VRAM**：只读采集 GPU 型号、显存用量（带进度条，>85% 警告色、>95% 错误色）、GPU 利用率、温度、功耗；优先 `rocm-smi`（PATH 或 `~/bin/rocm-smi`），回退 `nvidia-smi`，2 秒超时，无 GPU 工具时优雅隐藏
 - **槽位状态**：来自 `GET /slots`（处理中/空闲、提示词与生成 tokens、实时速度）
 - **指标看板**：解析 `GET /metrics` 的 Prometheus 文本（`llamacpp:*` 指标），4×2 对称网格展示生成速度、提示词速度、spec 接受率、KV 缓存命中率、上下文高水位、处理中/排队请求、提示词/生成 tokens 累计；全量指标折叠收纳
+- **快速测速**：模型卡内一键测速按钮，向 `/v1/chat/completions` 发极短请求，返回耗时 / Prefill / Decode 速度 / MTP 接受率（`POST /api/probe`，失败返回 502 并内联提示）
+- **实时趋势**：纯原生 SVG 双图（生成/提示词速度 + VRAM 占用/GPU 温度），保留最近 60 个采样点（约 2 分钟），无 GPU 数据时第二张图隐藏、第一张撑满整行
+- **日志查看器**：关键词搜索、告警/错误过滤、测速行过滤、100/200/500 行切换、暂停/恢复滚屏、一键复制当前过滤结果
 - **外部进程识别**：server 不是面板启动的也没关系——面板会按端口自动发现本机监听进程（Windows `netstat`，Linux `ss`/`lsof`），显示"运行中（外部）· PID"，并可直接停止
-- 单页深色界面，自动轮询刷新（状态 2s / 日志 5s），无前端依赖，移动端自适应
+- 单页深色界面，自动轮询刷新（状态 2s / 日志 5s），页头显示最后刷新时间并可手动刷新，无前端依赖，移动端自适应
 
 ## 环境
 
@@ -65,6 +68,7 @@ python main.py --systemd-unit llama-server.service --log /var/log/llama-server.l
 | POST | `/api/server/start` | 启动 llama-server（已在运行返回 409；systemd 模式走 `systemctl start`） |
 | POST | `/api/server/stop` | 停止 llama-server（外部启动的按端口发现的 PID 终止；systemd 模式走 `systemctl stop`） |
 | POST | `/api/server/restart` | 重启 llama-server（面板模式先停后启；systemd 模式走 `systemctl restart`） |
+| POST | `/api/probe` | 一键快速测速：极短 chat 请求，返回耗时 / Prefill / Decode / MTP 接受率；失败 502 |
 
 ## 结构
 
@@ -72,12 +76,12 @@ python main.py --systemd-unit llama-server.service --log /var/log/llama-server.l
 main.py              # 入口（参数解析）
 llama_panel/
   app.py             # Flask 应用与 API（含 systemd 托管）
-  client.py          # llama-server HTTP 客户端 + Prometheus 解析
+  client.py          # llama-server HTTP 客户端 + Prometheus 解析 + 快速测速 probe
   gpu.py             # GPU/VRAM 只读采集（rocm-smi / nvidia-smi）+ 纯函数解析
   process.py         # 进程管理 + 按端口发现/终止外部进程
 static/index.html    # 单页面板
 fake_llama.py        # 测试用假 llama-server
-test_e2e.py          # 端到端测试（外部进程识别 + 启停/重启 + GPU 解析单测）
+test_e2e.py          # 端到端测试（外部进程识别 + 启停/重启 + 快速测速 + GPU 解析与 systemd uptime 单测）
 ```
 
 ## 测试

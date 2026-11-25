@@ -1,6 +1,7 @@
 """Flask 应用：llama.cpp 监控与控制面板 API。"""
 from __future__ import annotations
 
+import math
 import os
 import subprocess
 import time
@@ -31,6 +32,23 @@ def _systemctl(args: list[str]) -> tuple[bool, str]:
     return True, text
 
 
+def parse_systemd_uptime(active_enter_ts_usec: str, now_ts: float | None = None) -> float | None:
+    """把 ActiveEnterTimestampMonotonic 的微秒值解析为运行时长（秒）。
+
+    now_ts 为单调时钟秒数（默认 time.monotonic()）。
+    输入无效、非正、或结果 <= 0 时返回 None。
+    """
+    try:
+        usec = float(str(active_enter_ts_usec).strip())
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(usec) or usec <= 0:
+        return None
+    now = time.monotonic() if now_ts is None else now_ts
+    up = (now * 1e6 - usec) / 1e6
+    return up if up > 0 else None
+
+
 class SystemdService:
     """通过 systemd 管理 llama-server 单元（非 root 无免密权限时操作会失败）。"""
 
@@ -41,12 +59,18 @@ class SystemdService:
         ok, text = _systemctl(["is-active", self.unit])
         active = ok and text == "active"
         pid = None
+        uptime = None
         if active:
             ok2, pid_text = _systemctl(["show", "-p", "MainPID", "--value", self.unit])
             if ok2 and pid_text.isdigit():
                 pid = int(pid_text)
+            ok3, up_text = _systemctl(
+                ["show", "-p", "ActiveEnterTimestampMonotonic", "--value", self.unit]
+            )
+            if ok3:
+                uptime = parse_systemd_uptime(up_text)
         return {"running": active, "external": False, "pid": pid,
-                "uptime": None, "command": [f"systemd:{self.unit}"]}
+                "uptime": uptime, "command": [f"systemd:{self.unit}"]}
 
     def _call(self, action: str) -> tuple[bool, str]:
         return _systemctl([action, self.unit])
@@ -127,6 +151,16 @@ def create_app(
     def api_logs():
         n = request.args.get("n", 200, type=int)
         return jsonify({"lines": proc.tail(n)})
+
+    @app.post("/api/probe")
+    def api_probe():
+        """一键快速测速：极短 chat 请求，返回耗时与 prefill/decode 速度。"""
+        model = None
+        data = request.get_json(silent=True)
+        if isinstance(data, dict):
+            model = data.get("model")
+        result = client.probe(model)
+        return jsonify(result), (200 if result.get("ok") else 502)
 
     @app.post("/api/server/start")
     def api_server_start():

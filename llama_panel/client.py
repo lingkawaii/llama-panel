@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import re
+import time
 
 import requests
 
@@ -66,6 +67,58 @@ class LlamaClient:
             return r.json()
         except (requests.RequestException, ValueError):
             return None
+
+    def probe(self, model: str | None = None, timeout: float = 30.0) -> dict:
+        """发送极短 chat 请求测速，返回 timings 解析结果。
+
+        成功: {"ok": True, "wall_ms", "prompt_tps", "gen_tps",
+               "prompt_n", "predicted_n", "spec_accept_percent"}
+        失败: {"ok": False, "error": "..."}
+        """
+        if model is None:
+            models = self.models()
+            data = models.get("data") if isinstance(models, dict) else None
+            if isinstance(data, list) and data and isinstance(data[0], dict):
+                model = data[0].get("id") or "default"
+            else:
+                model = "default"
+        payload = {
+            "model": model,
+            "messages": [{"role": "user", "content": "Reply OK and count 1 to 5."}],
+            "max_tokens": 32,
+            "temperature": 0.0,
+            "stream": False,
+        }
+        try:
+            start = time.perf_counter()
+            r = self._session.post(
+                self.base_url + "/v1/chat/completions", json=payload, timeout=timeout
+            )
+            wall_ms = (time.perf_counter() - start) * 1000
+            r.raise_for_status()
+            data = r.json()
+        except requests.RequestException as e:
+            return {"ok": False, "error": f"请求失败: {e}"}
+        except ValueError:
+            return {"ok": False, "error": "响应不是合法 JSON"}
+        timings = data.get("timings") if isinstance(data, dict) else None
+        if not isinstance(timings, dict):
+            timings = {}
+        draft_n = timings.get("draft_n")
+        draft_accepted = timings.get("draft_n_accepted")
+        spec = None
+        if isinstance(draft_n, (int, float)) and draft_n > 0 \
+                and isinstance(draft_accepted, (int, float)):
+            spec = draft_accepted / draft_n * 100
+        return {
+            "ok": True,
+            "wall_ms": round(wall_ms, 1),
+            "prompt_tps": timings.get("prompt_per_second"),
+            "gen_tps": timings.get("predicted_per_second"),
+            "prompt_n": timings.get("prompt_n"),
+            "predicted_n": timings.get("predicted_n"),
+            "spec_accept_percent": spec,
+        }
 
     def slots(self) -> list[dict]:
         """GET /slots，返回槽位状态列表（服务端 --no-slots 时为空）。"""

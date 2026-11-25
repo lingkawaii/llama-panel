@@ -58,15 +58,43 @@
             border-radius: 6px; color: var(--err); font-size: 12px; }
   details summary { cursor: pointer; color: var(--muted); font-size: 13px; margin-bottom: 8px; }
   details summary:hover { color: var(--fg); }
+  .header { display: flex; align-items: center; justify-content: space-between;
+            gap: 12px; flex-wrap: wrap; }
+  .header h1 { margin: 8px 0; }
+  .trend-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr));
+               gap: 12px; margin-top: 12px; }
+  .trend-grid.single { grid-template-columns: 1fr; }
+  @media (max-width: 768px) {
+    .trend-grid { grid-template-columns: 1fr; }
+  }
+  .trend-svg { width: 100%; height: auto; display: block; }
+  .trend-legend { font-size: 12px; color: var(--muted); margin-top: 6px; }
+  .trend-legend span { margin-right: 12px; }
+  .trend-legend b { color: var(--fg); font-weight: 500; }
+  #slot-table th, #slot-table td { white-space: nowrap; }
+  .log-toolbar { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-bottom: 8px; }
+  .log-toolbar input[type="search"] { background: #010409; color: var(--fg);
+        border: 1px solid var(--border); border-radius: 6px; padding: 5px 8px;
+        font-size: 12px; width: 160px; }
+  .log-toolbar select { background: var(--card); color: var(--fg);
+        border: 1px solid var(--border); border-radius: 6px; padding: 4px 6px; font-size: 12px; }
+  .log-f { padding: 4px 10px; font-size: 12px; }
+  .log-f.active { border-color: var(--accent); color: var(--accent); }
 </style>
 </head>
 <body>
 <div class="wrap">
-  <h1>
-    <span class="dot" id="dot"></span>
-    llama.cpp 控制面板
-    <span class="muted" id="server-url"></span>
-  </h1>
+  <div class="header">
+    <h1>
+      <span class="dot" id="dot"></span>
+      llama.cpp 控制面板
+      <span class="muted" id="server-url"></span>
+    </h1>
+    <div class="row">
+      <span class="muted" id="last-refresh"></span>
+      <button id="btn-refresh">刷新</button>
+    </div>
+  </div>
 
   <section>
     <h2>服务</h2>
@@ -99,6 +127,18 @@
   <section>
     <h2>指标</h2>
     <div class="metrics-grid" id="metric-cards"></div>
+    <div class="trend-grid" id="trend-grid">
+      <div class="card" id="trend-throughput">
+        <div class="label">吞吐趋势（近 2 分钟）</div>
+        <svg class="trend-svg" id="svg-throughput" viewBox="0 0 400 110"></svg>
+        <div class="trend-legend" id="legend-throughput"></div>
+      </div>
+      <div class="card" id="trend-gpu">
+        <div class="label">显卡趋势（近 2 分钟）</div>
+        <svg class="trend-svg" id="svg-gpu" viewBox="0 0 400 110"></svg>
+        <div class="trend-legend" id="legend-gpu"></div>
+      </div>
+    </div>
     <div class="card" style="margin-top:12px">
       <details id="metric-details">
         <summary>全量指标（0）</summary>
@@ -128,7 +168,22 @@
 
   <section>
     <h2>日志</h2>
-    <div id="logs"></div>
+    <div class="card">
+      <div class="log-toolbar">
+        <input id="log-search" type="search" placeholder="搜索关键词…">
+        <button id="log-f-all" class="log-f active">全部</button>
+        <button id="log-f-warn" class="log-f">告警/错误</button>
+        <button id="log-f-speed" class="log-f">测速</button>
+        <select id="log-n">
+          <option value="100">100 行</option>
+          <option value="200" selected>200 行</option>
+          <option value="500">500 行</option>
+        </select>
+        <button id="log-pause">暂停滚屏</button>
+        <button id="log-copy">复制日志</button>
+      </div>
+      <div id="logs"></div>
+    </div>
   </section>
 </div>
 
@@ -136,6 +191,18 @@
 const $ = (id) => document.getElementById(id);
 let lastProc = null; // 最近一次状态里的进程信息（供日志区提示用）
 let busy = false;   // 启停/重启请求进行中（防连点）
+let lastHealth = false; // server 是否健康（测速按钮可用性）
+let probing = false;    // 测速请求进行中
+let probeResultHtml = ""; // 测速结果展示
+let logLines = [];    // 最近一次拉取的日志行
+let logFilter = "all"; // all | warn | speed
+let logSearch = "";
+let logPaused = false;
+let logN = 200;
+const LOG_FILTERS = {
+  warn: / W | E |error|warn/i,
+  speed: /print_timing|eval time|draft acceptance/i,
+};
 
 // 按基础名查找指标（兼容带标签的变体）
 function metricValue(metrics, name) {
@@ -207,10 +274,87 @@ function kvHit(m) {
 }
 
 function cardHtml(label, value, unit) {
+  if (value === null || value === undefined) {
+    return `<div class="card"><div class="label">${label}</div>
+    <div class="value">—</div></div>`;
+  }
   const u = unit ? `<span class="unit">${unit}</span>` : "";
-  const v = value === null || value === undefined ? "—" : fmtNum(value);
   return `<div class="card"><div class="label">${label}</div>
-    <div class="value">${v}${u}</div></div>`;
+    <div class="value">${fmtNum(value)}${u}</div></div>`;
+}
+
+// ---- 实时趋势（最近 60 个采样点 ≈ 2 分钟）----
+const TREND_MAX = 60;
+const trend = { gen: [], prompt: [], vram: [], temp: [] };
+
+function pushTrend(m, g) {
+  trend.gen.push(m ? metricValue(m, "llamacpp:predicted_tokens_seconds") : null);
+  trend.prompt.push(m ? metricValue(m, "llamacpp:prompt_tokens_seconds") : null);
+  trend.vram.push(g && g.vram_percent !== null && g.vram_percent !== undefined ? g.vram_percent : null);
+  trend.temp.push(g && g.temp_c !== null && g.temp_c !== undefined ? g.temp_c : null);
+  for (const k of Object.keys(trend)) {
+    if (trend[k].length > TREND_MAX) trend[k].shift();
+  }
+}
+
+function trendLines(series) {
+  const W = 400, H = 110, P = 6;
+  let max = 0;
+  for (const s of series) for (const v of s.data) if (v !== null && v > max) max = v;
+  if (max <= 0) return "";
+  max *= 1.15;
+  const x = (i) => P + i * (W - 2 * P) / (TREND_MAX - 1);
+  const y = (v) => H - P - (v / max) * (H - 2 * P);
+  let out = "";
+  for (let f = 0; f <= 4; f++) {
+    const gy = (P + (f * (H - 2 * P)) / 4).toFixed(1);
+    out += `<line x1="${P}" y1="${gy}" x2="${W - P}" y2="${gy}" stroke="#30363d" stroke-width="0.5" opacity="0.5"/>`;
+  }
+  for (const s of series) {
+    let seg = [], segs = [];
+    s.data.forEach((v, i) => {
+      if (v === null) { if (seg.length) segs.push(seg); seg = []; }
+      else seg.push([x(i), y(v)]);
+    });
+    if (seg.length) segs.push(seg);
+    for (const sg of segs) {
+      const d = sg.map((p, i) => (i ? "L" : "M") + p[0].toFixed(1) + " " + p[1].toFixed(1)).join(" ");
+      if (sg.length > 1) {
+        out += `<path d="${d} L${sg[sg.length - 1][0].toFixed(1)} ${H - P} L${sg[0][0].toFixed(1)} ${H - P} Z" fill="${s.color}" opacity="0.12"/>`;
+      }
+      out += `<path d="${d}" fill="none" stroke="${s.color}" stroke-width="1.5"/>`;
+    }
+  }
+  return out;
+}
+
+function trendLegend(series) {
+  return series.map((s) => {
+    const vals = s.data.filter((v) => v !== null);
+    const last = vals.length ? vals[vals.length - 1] : null;
+    const peak = vals.length ? Math.max(...vals) : null;
+    return `<span>${s.name} <b>${last === null ? "—" : s.fmt(last)}</b> · 峰值 ${peak === null ? "—" : s.fmt(peak)}</span>`;
+  }).join("");
+}
+
+function renderTrends() {
+  const genSeries = [
+    { name: "生成速度", color: "var(--ok)", data: trend.gen, fmt: (v) => v.toFixed(1) + " tok/s" },
+    { name: "提示词速度", color: "var(--accent)", data: trend.prompt, fmt: (v) => v.toFixed(0) + " tok/s" },
+  ];
+  $("svg-throughput").innerHTML = trendLines(genSeries);
+  $("legend-throughput").innerHTML = trendLegend(genSeries);
+  const gpuHas = trend.vram.some((v) => v !== null) || trend.temp.some((v) => v !== null);
+  $("trend-gpu").style.display = gpuHas ? "" : "none";
+  $("trend-grid").classList.toggle("single", !gpuHas);
+  if (gpuHas) {
+    const gpuSeries = [
+      { name: "VRAM 占用", color: "var(--warn)", data: trend.vram, fmt: (v) => v.toFixed(1) + "%" },
+      { name: "GPU 温度", color: "var(--accent)", data: trend.temp, fmt: (v) => v.toFixed(0) + "°C" },
+    ];
+    $("svg-gpu").innerHTML = trendLines(gpuSeries);
+    $("legend-gpu").innerHTML = trendLegend(gpuSeries);
+  }
 }
 
 function renderGpu(g) {
@@ -239,13 +383,14 @@ function renderGpu(g) {
 function renderStatus(data) {
   const s = data.server, p = s.process;
   lastProc = p;
+  lastHealth = !!s.health;
   $("dot").className = "dot" + (s.health ? " on" : "");
   $("proc-dot").className = "dot" + (p.running ? " on" : "");
   $("server-url").textContent = s.base_url;
   $("proc-state").textContent = p.running
     ? (p.external
         ? `运行中（外部）· PID ${p.pid}`
-        : `运行中 · PID ${p.pid} · ${fmtUptime(p.uptime)}`)
+        : `运行中 · PID ${p.pid}${p.uptime !== null && p.uptime !== undefined ? ` · ${fmtUptime(p.uptime)}` : ""}`)
     : "未运行";
   $("proc-cmd").textContent = p.external ? "（外部启动，非面板拉起）" : p.command.join(" ");
   if (!busy) {
@@ -263,8 +408,17 @@ function renderStatus(data) {
     meta.size ? fmtBytes(meta.size) : null,
   ].filter(Boolean);
   $("model-card").innerHTML = mid
-    ? `<div class="label">模型</div><div class="value" style="font-size:16px">${mid}</div>
-       <div class="sub">${subs.join(" · ")}</div>`
+    ? `<div class="row">
+         <div style="flex:1;min-width:0">
+           <div class="label">模型</div>
+           <div class="value" style="font-size:16px">${mid}</div>
+           <div class="sub">${subs.join(" · ")}</div>
+         </div>
+         <span class="actions">
+           <button id="btn-probe" ${probing || !s.health ? "disabled" : ""}>${probing ? "测速中…" : "快速测速"}</button>
+         </span>
+       </div>
+       <div class="sub" id="probe-result">${probeResultHtml}</div>`
     : `<span class="muted">无模型信息（服务未启动或未加载模型）</span>`;
 
   // 显卡 / VRAM
@@ -287,6 +441,10 @@ function renderStatus(data) {
     ["生成 tokens 累计", m ? metricValue(m, "llamacpp:tokens_predicted_total") : null, ""],
   ];
   $("metric-cards").innerHTML = cards.map(([l, v, u]) => cardHtml(l, v, u)).join("");
+
+  // 实时趋势
+  pushTrend(m, data.gpu);
+  renderTrends();
 
   // 全量指标表（折叠）
   const count = m ? Object.keys(m).length : 0;
@@ -349,26 +507,121 @@ async function fetchStatus() {
   try {
     const r = await fetch("/api/status");
     renderStatus(await r.json());
+    $("last-refresh").textContent = "最后刷新 " + new Date().toTimeString().slice(0, 8);
   } catch (e) {
     $("dot").className = "dot";
     $("proc-state").textContent = "面板连接失败";
   }
 }
 
+// ---- 日志查看器 ----
+function logMatch(line) {
+  if (logFilter !== "all" && !LOG_FILTERS[logFilter].test(line)) return false;
+  if (logSearch && !line.toLowerCase().includes(logSearch)) return false;
+  return true;
+}
+
+function filteredLogs() {
+  return logLines.filter(logMatch);
+}
+
+function renderLogs() {
+  const box = $("logs");
+  const atBottom = box.scrollHeight - box.scrollTop - box.clientHeight < 20;
+  let text;
+  if (!logLines.length) {
+    // 日志文件有内容就直接显示（外部/systemd 启动也一样）
+    text = lastProc && lastProc.running
+      ? "无日志：将 --log 指向服务的日志文件，或用面板「启动」接管。"
+      : "无日志";
+  } else {
+    text = filteredLogs().join("\n") || "（无匹配日志）";
+  }
+  box.textContent = text;
+  if (!logPaused && atBottom) box.scrollTop = box.scrollHeight;
+}
+
 async function fetchLogs() {
   try {
-    const r = await fetch("/api/logs?n=200");
+    const r = await fetch(`/api/logs?n=${logN}`);
     const data = await r.json();
-    const box = $("logs");
-    const atBottom = box.scrollHeight - box.scrollTop - box.clientHeight < 20;
-    // 日志文件有内容就直接显示（外部/systemd 启动也一样）
-    box.textContent = data.lines.join("\n") ||
-      (lastProc && lastProc.running
-        ? "无日志：将 --log 指向服务的日志文件，或用面板「启动」接管。"
-        : "无日志");
-    if (atBottom) box.scrollTop = box.scrollHeight;
+    logLines = data.lines || [];
+    renderLogs();
   } catch {}
 }
+
+const LOG_FILTER_BTNS = [["log-f-all", "all"], ["log-f-warn", "warn"], ["log-f-speed", "speed"]];
+for (const [id, f] of LOG_FILTER_BTNS) {
+  $(id).onclick = () => {
+    logFilter = f;
+    for (const [bid, bf] of LOG_FILTER_BTNS) $(bid).classList.toggle("active", bf === f);
+    renderLogs();
+  };
+}
+$("log-search").oninput = (e) => { logSearch = e.target.value.trim(); renderLogs(); };
+$("log-n").onchange = (e) => { logN = parseInt(e.target.value, 10); fetchLogs(); };
+$("log-pause").onclick = () => {
+  logPaused = !logPaused;
+  $("log-pause").textContent = logPaused ? "恢复滚屏" : "暂停滚屏";
+};
+$("log-copy").onclick = async () => {
+  const text = filteredLogs().join("\n");
+  try {
+    if (navigator.clipboard) await navigator.clipboard.writeText(text);
+    else {
+      const ta = document.createElement("textarea");
+      ta.value = text;
+      ta.style.position = "fixed";
+      ta.style.opacity = "0";
+      document.body.appendChild(ta);
+      ta.select();
+      document.execCommand("copy");
+      ta.remove();
+    }
+  } catch {}
+  const btn = $("log-copy");
+  btn.textContent = "已复制";
+  setTimeout(() => { btn.textContent = "复制日志"; }, 1500);
+};
+
+// ---- 模型卡快速测速 ----
+function probeLine(d) {
+  const parts = [`耗时 ${(d.wall_ms / 1000).toFixed(1)}s`];
+  if (d.prompt_tps !== null && d.prompt_tps !== undefined) parts.push(`Prefill ${d.prompt_tps.toFixed(0)} tok/s`);
+  if (d.gen_tps !== null && d.gen_tps !== undefined) parts.push(`Decode ${d.gen_tps.toFixed(1)} tok/s`);
+  if (d.spec_accept_percent !== null && d.spec_accept_percent !== undefined) parts.push(`MTP ${d.spec_accept_percent.toFixed(1)}%`);
+  return parts.join(" · ");
+}
+
+async function runProbe() {
+  if (probing) return;
+  probing = true;
+  probeResultHtml = '<span class="muted">测速中…</span>';
+  const btn = $("btn-probe");
+  if (btn) { btn.textContent = "测速中…"; btn.disabled = true; }
+  const res = $("probe-result");
+  if (res) res.innerHTML = probeResultHtml;
+  try {
+    const r = await fetch("/api/probe", { method: "POST" });
+    const d = await r.json();
+    probeResultHtml = d.ok
+      ? `<span class="muted">${probeLine(d)}</span>`
+      : `<span style="color:var(--err)">${d.error || "测速失败"}</span>`;
+  } catch (e) {
+    probeResultHtml = `<span style="color:var(--err)">测速失败: ${e}</span>`;
+  }
+  probing = false;
+  const b = $("btn-probe");
+  if (b) { b.textContent = "快速测速"; b.disabled = !lastHealth; }
+  const el = $("probe-result");
+  if (el) el.innerHTML = probeResultHtml;
+}
+
+$("model-card").addEventListener("click", (e) => {
+  if (e.target.id === "btn-probe" && !e.target.disabled) runProbe();
+});
+
+$("btn-refresh").onclick = () => { fetchStatus(); fetchLogs(); };
 
 $("btn-start").onclick = () => serverAction("/api/server/start", null);
 $("btn-stop").onclick = () => serverAction("/api/server/stop", "确认停止 llama-server 服务？");

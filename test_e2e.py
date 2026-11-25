@@ -5,6 +5,7 @@ import socket
 import subprocess
 import sys
 import time
+import urllib.error
 import urllib.request
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -25,6 +26,16 @@ def post(path):
     req = urllib.request.Request(f"http://127.0.0.1:{PANEL_PORT}{path}", method="POST")
     with urllib.request.urlopen(req, timeout=25) as r:
         return json.loads(r.read())
+
+
+def post_raw(path):
+    """POST，返回 (状态码, JSON 体)；非 2xx 不抛异常。"""
+    req = urllib.request.Request(f"http://127.0.0.1:{PANEL_PORT}{path}", method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=25) as r:
+            return r.status, json.loads(r.read())
+    except urllib.error.HTTPError as e:
+        return e.code, json.loads(e.read())
 
 
 def wait_status(predicate, what, timeout=40):
@@ -161,8 +172,52 @@ def test_gpu_parsers():
     print("A) gpu parser unit tests passed")
 
 
+def test_parse_systemd_uptime():
+    """纯函数单测：ActiveEnterTimestampMonotonic 微秒值 → 运行时长秒数。"""
+    from llama_panel.app import parse_systemd_uptime
+
+    # 固定 now_ts：1e6 微秒 = 1s，now=10s → 9s
+    assert parse_systemd_uptime("1000000", now_ts=10.0) == 9.0
+    # 空白 / 浮点字符串
+    assert abs(parse_systemd_uptime(" 2000000.5 ", now_ts=10.0) - 8.0) < 1e-6
+    # 无效输入
+    assert parse_systemd_uptime("") is None
+    assert parse_systemd_uptime("0") is None
+    assert parse_systemd_uptime("abc") is None
+    assert parse_systemd_uptime("-5") is None
+    # 未来时间戳（结果 <= 0）
+    assert parse_systemd_uptime("99999999999999", now_ts=10.0) is None
+    # now_ts=None 走 time.monotonic()
+    usec = int((time.monotonic() - 5) * 1e6)
+    up = parse_systemd_uptime(str(usec))
+    assert up is not None and 4.9 < up < 5.5, f"monotonic 分支异常: {up}"
+    print("B) parse_systemd_uptime unit tests passed")
+
+
+def test_probe_ok():
+    """端到端：server 运行时 POST /api/probe 返回 200 + timings 解析。"""
+    status, d = post_raw("/api/probe")
+    assert status == 200 and d["ok"] is True, f"probe 应成功: {status} {d}"
+    assert d["wall_ms"] > 0
+    assert d["prompt_tps"] == 820.0
+    assert d["gen_tps"] == 58.4
+    assert d["prompt_n"] == 128
+    assert d["predicted_n"] == 10
+    assert abs(d["spec_accept_percent"] - 70.0) < 1e-6
+    print("probe ok:", d)
+
+
+def test_probe_down():
+    """端到端：server 停止后 POST /api/probe 返回 502 + ok False。"""
+    status, d = post_raw("/api/probe")
+    assert status == 502 and d["ok"] is False, f"probe 应 502: {status} {d}"
+    assert d.get("error"), "缺少 error 信息"
+    print("probe down:", status, d)
+
+
 def main():
     test_gpu_parsers()
+    test_parse_systemd_uptime()
 
     for p in (FAKE_PORT, PANEL_PORT):
         assert not port_in_use(p), f"端口 {p} 已被占用，先清理残留进程"
@@ -239,6 +294,9 @@ def main():
         old_panel_pid = s3["server"]["process"]["pid"]
         print("6) panel started server, real pid:", managed_pid)
 
+        # 6b) server 运行时一键测速
+        test_probe_ok()
+
         # 7) 重启：先停后启，实际进程 pid 必须变化
         r = post("/api/server/restart")
         print("7) restart response:", r)
@@ -264,6 +322,9 @@ def main():
         wait_port_free(FAKE_PORT)
         print("8) stopped and port free")
 
+        # 8b) server 停止后测速应 502
+        test_probe_down()
+
         print("\nALL E2E CHECKS PASSED")
     finally:
         for proc in (panel, fake):
@@ -283,8 +344,11 @@ def main():
         wait_port_free(FAKE_PORT, timeout=5)
         fake_log.close()
         panel_log.close()
-        if os.path.exists(PID_FILE):
-            os.remove(PID_FILE)
+        for f in (PID_FILE, os.path.join(HERE, "test_fake.log"), os.path.join(HERE, "test_panel.log")):
+            try:
+                os.remove(f)
+            except OSError:
+                pass
 
 
 if __name__ == "__main__":
