@@ -214,6 +214,15 @@ function metricValue(metrics, name) {
   return null;
 }
 
+function escHtml(s) {
+  return String(s)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
 function fmtNum(v) {
   if (v === null || v === undefined) return "—";
   if (typeof v === "number") {
@@ -301,10 +310,9 @@ function trendLines(series) {
   const W = 400, H = 110, P = 6;
   let max = 0;
   for (const s of series) for (const v of s.data) if (v !== null && v > max) max = v;
-  if (max <= 0) return "";
-  max *= 1.15;
+  const ceiling = max > 0 ? max * 1.15 : 1;
   const x = (i) => P + i * (W - 2 * P) / (TREND_MAX - 1);
-  const y = (v) => H - P - (v / max) * (H - 2 * P);
+  const y = (v) => H - P - (v / ceiling) * (H - 2 * P);
   let out = "";
   for (let f = 0; f <= 4; f++) {
     const gy = (P + (f * (H - 2 * P)) / 4).toFixed(1);
@@ -375,7 +383,7 @@ function renderGpu(g) {
     `功耗 ${g.power_w !== null ? g.power_w.toFixed(1) + " W" : "—"}`,
   ].join(" · ");
   el.innerHTML = `<div class="label">显卡</div>
-    <div class="value" style="font-size:16px">${g.name}</div>
+    <div class="value" style="font-size:16px">${escHtml(g.name)}</div>
     ${bar}
     <div class="sub">${sub}</div>`;
 }
@@ -411,7 +419,7 @@ function renderStatus(data) {
     ? `<div class="row">
          <div style="flex:1;min-width:0">
            <div class="label">模型</div>
-           <div class="value" style="font-size:16px">${mid}</div>
+           <div class="value" style="font-size:16px">${escHtml(mid)}</div>
            <div class="sub">${subs.join(" · ")}</div>
          </div>
          <span class="actions">
@@ -558,7 +566,7 @@ for (const [id, f] of LOG_FILTER_BTNS) {
     renderLogs();
   };
 }
-$("log-search").oninput = (e) => { logSearch = e.target.value.trim(); renderLogs(); };
+$("log-search").oninput = (e) => { logSearch = e.target.value.trim().toLowerCase(); renderLogs(); };
 $("log-n").onchange = (e) => { logN = parseInt(e.target.value, 10); fetchLogs(); };
 $("log-pause").onclick = () => {
   logPaused = !logPaused;
@@ -606,9 +614,9 @@ async function runProbe() {
     const d = await r.json();
     probeResultHtml = d.ok
       ? `<span class="muted">${probeLine(d)}</span>`
-      : `<span style="color:var(--err)">${d.error || "测速失败"}</span>`;
+      : `<span style="color:var(--err)">${escHtml(d.error || "测速失败")}</span>`;
   } catch (e) {
-    probeResultHtml = `<span style="color:var(--err)">测速失败: ${e}</span>`;
+    probeResultHtml = `<span style="color:var(--err)">测速失败: ${escHtml(e)}</span>`;
   }
   probing = false;
   const b = $("btn-probe");
