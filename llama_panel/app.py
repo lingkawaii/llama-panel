@@ -4,6 +4,7 @@ from __future__ import annotations
 import math
 import os
 import subprocess
+import threading
 import time
 from urllib.parse import urlparse
 
@@ -104,6 +105,15 @@ def create_app(
     _host = urlparse(server_url).hostname or ""
     _port = urlparse(server_url).port
 
+    # 并发防护：Flask 默认多线程。状态轮询与卸载并发时，status 可能在
+    # 模型卸载中/刚卸载后向 Router 发 ?model= 的 /slots /metrics 请求，
+    # 触发 --models-autoload 误唤醒。model_lock 串行化状态查询与
+    # 加载/卸载；卸载后 /api/status 在 UNLOAD_COOLDOWN_SEC 秒冷却期内
+    # 跳过 /slots /metrics（time.monotonic() 秒，nonlocal 维护）。
+    model_lock = threading.Lock()
+    unload_cooldown_until = 0.0
+    UNLOAD_COOLDOWN_SEC = 5.0
+
     def _external_pid() -> int | None:
         """面板未管理但 server 健康时，按端口发现本机外部进程 PID。"""
         if _host not in _LOCAL_HOSTS or _port is None:
@@ -132,19 +142,24 @@ def create_app(
 
     @app.get("/api/status")
     def api_status():
-        models = client.models()
-        ms = parse_model_state(models)
-        # Router 模式防误唤醒：仅 loaded 时才能请求 /slots 与 /metrics，
-        # unloaded 状态下请求它们会触发 --models-autoload 误唤醒模型。
-        if ms["router_mode"]:
-            if ms["state"] == "loaded" and ms["model_id"]:
-                slots = client.slots(ms["model_id"])
-                metrics = client.metrics(ms["model_id"])
+        # 持锁完成「查模型状态 → 查 slots/metrics」整段，
+        # 避免卸载在中间插入、对卸载中/刚卸载的模型发 ?model= 请求误唤醒。
+        with model_lock:
+            models = client.models()
+            ms = parse_model_state(models)
+            # Router 模式防误唤醒：仅 loaded 且不在卸载冷却期内才能请求
+            # /slots 与 /metrics；unloaded 或冷却期内请求它们会触发
+            # --models-autoload 误唤醒模型。
+            if ms["router_mode"]:
+                in_cooldown = time.monotonic() < unload_cooldown_until
+                if ms["state"] == "loaded" and ms["model_id"] and not in_cooldown:
+                    slots = client.slots(ms["model_id"])
+                    metrics = client.metrics(ms["model_id"])
+                else:
+                    slots, metrics = [], None
             else:
-                slots, metrics = [], None
-        else:
-            slots = client.slots()
-            metrics = client.metrics()
+                slots = client.slots()
+                metrics = client.metrics()
         return jsonify(
             {
                 "ts": time.time(),
@@ -179,19 +194,31 @@ def create_app(
     @app.post("/api/model/load")
     def api_model_load():
         """Router 模式手动加载模型（唤醒）。body 可选 {"model": "..."}。"""
+        nonlocal unload_cooldown_until
         model = _resolve_model()
         if not model:
             return jsonify({"ok": False, "error": "未指定 model，且当前无法从 /v1/models 获取 model_id"}), 400
-        result = client.load_model(model)
+        with model_lock:
+            # 主动加载：立即恢复 /api/status 的 /slots /metrics 查询。
+            unload_cooldown_until = 0.0
+            result = client.load_model(model)
         return jsonify(result), (200 if result.get("ok") else 502)
 
     @app.post("/api/model/unload")
     def api_model_unload():
         """Router 模式手动卸载模型释放显存。body 可选 {"model": "..."}。"""
+        nonlocal unload_cooldown_until
         model = _resolve_model()
         if not model:
             return jsonify({"ok": False, "error": "未指定 model，且当前无法从 /v1/models 获取 model_id"}), 400
-        result = client.unload_model(model)
+        with model_lock:
+            # 先进入冷却期：卸载期间 status 轮询不再请求 /slots /metrics。
+            unload_cooldown_until = time.monotonic() + UNLOAD_COOLDOWN_SEC
+            result = client.unload_model(model)
+            if result.get("ok"):
+                unload_cooldown_until = time.monotonic() + UNLOAD_COOLDOWN_SEC
+            else:
+                unload_cooldown_until = 0.0
         return jsonify(result), (200 if result.get("ok") else 502)
 
     @app.get("/api/logs")
@@ -202,10 +229,15 @@ def create_app(
     @app.post("/api/probe")
     def api_probe():
         """一键快速测速：极短 chat 请求，返回耗时与 prefill/decode 速度。"""
+        nonlocal unload_cooldown_until
         model = None
         data = request.get_json(silent=True)
         if isinstance(data, dict):
             model = data.get("model")
+        # 主动测速允许唤醒模型：清零冷却期，/api/status 立即恢复查询。
+        # 只在锁内清零，不在锁内执行耗时的 probe，避免阻塞 /api/status。
+        with model_lock:
+            unload_cooldown_until = 0.0
         result = client.probe(model)
         return jsonify(result), (200 if result.get("ok") else 502)
 

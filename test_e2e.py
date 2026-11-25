@@ -4,6 +4,7 @@ import os
 import socket
 import subprocess
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -402,6 +403,81 @@ def test_router_e2e():
     return fake2
 
 
+def test_router_cooldown():
+    """冷却期/并发防误唤醒：卸载后 /api/status 不得触发 autoload（冷却期 + 并发）。"""
+    # 1) 确保 loaded
+    post_raw("/api/model/load")
+    wait_status(
+        lambda d: (d["server"].get("model_state") or {}).get("state") == "loaded",
+        "cooldown test: loaded",
+    )
+
+    # 2) 冷却期：卸载后立即模拟 stale loaded 视图（Router 状态滞后），
+    #    /api/status 必须跳过 /slots /metrics
+    code, d = post_raw("/api/model/unload")
+    assert code == 200 and d.get("ok") is True, f"unload 应成功: {code} {d}"
+    fake_get("/debug/stale_loaded")
+    s = get("/api/status")
+    ms = s["server"]["model_state"]
+    assert ms["state"] == "loaded", f"stale 视图应报 loaded: {ms}"
+    assert s["slots"] == [] and s["metrics"] is None, \
+        f"冷却期内不应请求 /slots /metrics: slots={s['slots']} metrics={s['metrics']}"
+    dbg = fake_get("/debug")
+    assert dbg["state"] == "unloaded", f"冷却期内被误唤醒: {dbg}"
+    assert dbg["slots_misfires"] == 0 and dbg["metrics_misfires"] == 0, f"误触发 autoload: {dbg}"
+    fake_get("/debug/stale_loaded?clear=1")
+    print("10a) 冷却期跳过 /slots /metrics:", dbg)
+
+    # 3) 并发：重新加载后，8 线程各轮询 5 次 /api/status，主线程中途发起 unload
+    post_raw("/api/model/load")
+    wait_status(
+        lambda d: (d["server"].get("model_state") or {}).get("state") == "loaded",
+        "cooldown test: reloaded",
+    )
+    errors = []
+
+    def poll():
+        for _ in range(5):
+            try:
+                get("/api/status")
+            except Exception as e:
+                errors.append(repr(e))
+            time.sleep(0.05)
+
+    threads = [threading.Thread(target=poll) for _ in range(8)]
+    for t in threads:
+        t.start()
+    time.sleep(0.2)
+    t_unload = time.monotonic()
+    code, d = post_raw("/api/model/unload")
+    assert code == 200 and d.get("ok") is True, f"unload 应成功: {code} {d}"
+    for t in threads:
+        t.join()
+    assert not errors, f"并发 status 请求出错: {errors}"
+    wait_status(
+        lambda d: (d["server"].get("model_state") or {}).get("state") == "unloaded",
+        "cooldown test: unloaded",
+    )
+    dbg = fake_get("/debug")
+    assert dbg["state"] == "unloaded", f"并发期间被误唤醒: {dbg}"
+    assert dbg["slots_misfires"] == 0 and dbg["metrics_misfires"] == 0, f"误触发 autoload: {dbg}"
+    print("10b) 并发 unload + status 无误唤醒:", dbg)
+
+    # 4) 冷却期结束（自第 3 步 unload 起 5s）：status 恢复 /slots /metrics 查询
+    #    （stale 视图仍报 loaded，查询会真实唤醒模型，属预期行为）
+    elapsed = time.monotonic() - t_unload
+    if elapsed < 5.5:
+        time.sleep(5.5 - elapsed)
+    fake_get("/debug/stale_loaded")
+    s = get("/api/status")
+    assert s["slots"], f"冷却期后应查询 /slots: {s['slots']}"
+    assert s["metrics"], f"冷却期后应查询 /metrics: {s['metrics']}"
+    fake_get("/debug/stale_loaded?clear=1")
+    dbg = fake_get("/debug")
+    assert dbg["state"] == "loaded", f"冷却期后查询应唤醒模型: {dbg}"
+    print("10c) 冷却期后恢复指标查询:", dbg)
+
+
 def main():
     test_gpu_parsers()
     test_parse_systemd_uptime()
@@ -517,6 +593,9 @@ def main():
 
         # 9) Router 模式端到端
         fake2 = test_router_e2e()
+
+        # 10) 冷却期/并发防误唤醒
+        test_router_cooldown()
 
         print("\nALL E2E CHECKS PASSED")
     finally:

@@ -7,6 +7,8 @@
 - POST /models/load 与 /models/unload 切换状态，返回 {"success": true}
 - /v1/chat/completions 收到请求时自动从 unloaded 切为 loaded（模拟 autoload 唤醒）
 - GET /debug 返回内部状态（state 与误唤醒计数），供测试断言
+- GET /debug/stale_loaded（带 ?clear=1 清除）：实际 unloaded 时 /v1/models
+  仍报 loaded（模拟 Router 状态滞后），供冷却期测试使用
 """
 import json
 import os
@@ -53,6 +55,7 @@ STATE = {
     "value": "unloaded" if ROUTER else "loaded",
     "slots_misfires": 0,   # unloaded 期间 /slots 被调用次数（误唤醒）
     "metrics_misfires": 0,  # unloaded 期间 /metrics 被调用次数（误唤醒）
+    "stale_loaded": False,  # /v1/models 报 loaded 即使实际 unloaded（模拟 Router 状态滞后）
 }
 
 
@@ -85,18 +88,19 @@ class H(BaseHTTPRequestHandler):
             self._send_json(200, {"status": "ok"})
         elif path == "/v1/models":
             if ROUTER:
+                value = "loaded" if STATE["stale_loaded"] else STATE["value"]
                 item = {
                     "id": MODEL_ID,
                     "object": "model",
                     "status": {
-                        "value": STATE["value"],
+                        "value": value,
                         "args": ["--models-preset", "models.ini",
                                  "--models-autoload",
                                  "--sleep-idle-seconds", str(SLEEP_IDLE)],
                         "preset": "models.ini",
                     },
                 }
-                if STATE["value"] == "loaded":
+                if value == "loaded":
                     item["meta"] = {"n_ctx": 32768, "n_params": 27000000000,
                                    "size": 17000000000, "ftype": "Q4_K_M"}
                 self._send_json(200, {"data": [item]})
@@ -129,6 +133,9 @@ class H(BaseHTTPRequestHandler):
             self._send_json(200, {"state": STATE["value"],
                                   "slots_misfires": STATE["slots_misfires"],
                                   "metrics_misfires": STATE["metrics_misfires"]})
+        elif path == "/debug/stale_loaded" and ROUTER:
+            STATE["stale_loaded"] = "clear" not in query
+            self._send_json(200, {"stale_loaded": STATE["stale_loaded"]})
         else:
             self.send_response(404)
             self.end_headers()
