@@ -1,9 +1,104 @@
-"""llama-server 进程管理：启动、停止、日志读取。"""
+"""llama-server 进程管理：启动、停止、日志读取、外部进程发现。"""
 from __future__ import annotations
 
 import os
+import re
+import signal
 import subprocess
 import time
+
+
+def _local_port(addr: str) -> int | None:
+    """从 "0.0.0.0:8080" / "[::1]:8080" / "*:8080" 提取端口。"""
+    if ":" not in addr:
+        return None
+    port = addr.rsplit(":", 1)[-1]
+    return int(port) if port.isdigit() else None
+
+
+def find_pid_on_port(port: int) -> int | None:
+    """查找监听指定端口的进程 PID（面板未管理的外部 server）。
+
+    Windows: netstat -ano；POSIX: ss -ltnp，回退 lsof。
+    """
+    if os.name == "nt":
+        try:
+            out = subprocess.run(
+                ["netstat", "-ano"], capture_output=True, timeout=5
+            ).stdout or b""
+        except (OSError, subprocess.SubprocessError):
+            return None
+        for line in out.decode("utf-8", "replace").splitlines():
+            parts = line.split()
+            # TCP 行: Proto Local Foreign State PID；本地端口 == 监听端口
+            # PID 0 是 TIME_WAIT 等内核态行，跳过
+            if (
+                len(parts) >= 5
+                and _local_port(parts[1]) == port
+                and parts[4].isdigit()
+                and parts[4] != "0"
+            ):
+                return int(parts[4])
+        return None
+
+    try:
+        out = subprocess.run(
+            ["ss", "-ltnp"], capture_output=True, timeout=5
+        ).stdout or b""
+        for line in out.decode("utf-8", "replace").splitlines():
+            fields = line.split()
+            if (
+                fields
+                and fields[0] == "LISTEN"
+                and len(fields) >= 4
+                and _local_port(fields[3]) == port
+            ):
+                m = re.search(r"pid=(\d+)", line)
+                if m:
+                    return int(m.group(1))
+    except (OSError, subprocess.SubprocessError):
+        pass
+    try:
+        out = subprocess.run(
+            ["lsof", f"-iTCP:{port}", "-sTCP:LISTEN", "-t"],
+            capture_output=True, timeout=5,
+        ).stdout or b""
+        pids = [int(x) for x in out.decode("utf-8", "replace").split() if x.isdigit()]
+        if pids:
+            return pids[0]
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return None
+
+
+def kill_pid(pid: int, timeout: float = 10.0) -> None:
+    """终止外部进程：POSIX SIGTERM→SIGKILL，Windows taskkill /T /F。"""
+    if pid <= 0:
+        return
+    if os.name == "nt":
+        try:
+            subprocess.run(
+                ["taskkill", "/PID", str(pid), "/T", "/F"],
+                capture_output=True, timeout=15,
+            )
+        except (OSError, subprocess.SubprocessError):
+            pass
+        return
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        return
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return
+        time.sleep(0.1)
+    try:
+        os.kill(pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
 
 
 class ServerProcess:

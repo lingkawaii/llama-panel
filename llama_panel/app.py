@@ -3,19 +3,29 @@ from __future__ import annotations
 
 import os
 import time
+from urllib.parse import urlparse
 
 from flask import Flask, jsonify, request, send_from_directory
 
 from .client import LlamaClient
-from .process import ServerProcess
+from .process import ServerProcess, find_pid_on_port, kill_pid
 
 _STATIC = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "static")
+_LOCAL_HOSTS = {"127.0.0.1", "localhost", "::1"}
 
 
 def create_app(server_url: str, server_command: list[str], log_path: str) -> Flask:
     app = Flask(__name__, static_folder=None)
     client = LlamaClient(server_url)
     proc = ServerProcess(server_command, log_path=log_path)
+    _host = urlparse(server_url).hostname or ""
+    _port = urlparse(server_url).port
+
+    def _external_pid() -> int | None:
+        """面板未管理但 server 健康时，按端口发现本机外部进程 PID。"""
+        if _host not in _LOCAL_HOSTS or _port is None:
+            return None
+        return find_pid_on_port(_port)
 
     @app.get("/")
     def index():
@@ -23,6 +33,17 @@ def create_app(server_url: str, server_command: list[str], log_path: str) -> Fla
 
     @app.get("/api/status")
     def api_status():
+        process = {
+            "pid": proc.pid,
+            "running": proc.is_running(),
+            "uptime": proc.uptime(),
+            "command": proc.command,
+            "external": False,
+        }
+        if not process["running"] and client.health():
+            ext = _external_pid()
+            if ext is not None:
+                process.update(running=True, external=True, pid=ext)
         return jsonify(
             {
                 "ts": time.time(),
@@ -30,12 +51,7 @@ def create_app(server_url: str, server_command: list[str], log_path: str) -> Fla
                     "base_url": server_url,
                     "health": client.health(),
                     "models": client.models(),
-                    "process": {
-                        "pid": proc.pid,
-                        "running": proc.is_running(),
-                        "uptime": proc.uptime(),
-                        "command": proc.command,
-                    },
+                    "process": process,
                 },
                 "slots": client.slots(),
                 "metrics": client.metrics(),
@@ -59,7 +75,12 @@ def create_app(server_url: str, server_command: list[str], log_path: str) -> Fla
 
     @app.post("/api/server/stop")
     def api_server_stop():
-        proc.stop()
+        if proc.is_running():
+            proc.stop()
+        else:
+            ext = _external_pid()
+            if ext is not None:
+                kill_pid(ext)
         return jsonify({"ok": True})
 
     return app

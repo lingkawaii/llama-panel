@@ -103,6 +103,7 @@
 
 <script>
 const $ = (id) => document.getElementById(id);
+let lastProc = null; // 最近一次状态里的进程信息（供日志区提示用）
 
 // 按基础名查找指标（兼容带标签的变体）
 function metricValue(metrics, name) {
@@ -138,13 +139,16 @@ function modelId(models) {
 
 function renderStatus(data) {
   const s = data.server, p = s.process;
+  lastProc = p;
   $("dot").className = "dot" + (s.health ? " on" : "");
   $("proc-dot").className = "dot" + (p.running ? " on" : "");
   $("server-url").textContent = s.base_url;
   $("proc-state").textContent = p.running
-    ? `运行中 · PID ${p.pid} · ${fmtUptime(p.uptime)}`
+    ? (p.external
+        ? `运行中（外部）· PID ${p.pid}`
+        : `运行中 · PID ${p.pid} · ${fmtUptime(p.uptime)}`)
     : "未运行";
-  $("proc-cmd").textContent = p.command.join(" ");
+  $("proc-cmd").textContent = p.external ? "（外部启动，非面板拉起）" : p.command.join(" ");
   $("btn-start").disabled = p.running;
   $("btn-stop").disabled = !p.running;
 
@@ -223,7 +227,11 @@ async function fetchLogs() {
     const data = await r.json();
     const box = $("logs");
     const atBottom = box.scrollHeight - box.scrollTop - box.clientHeight < 20;
-    box.textContent = data.lines.join("\n");
+    box.textContent = data.lines.join("\n") || (
+      lastProc && lastProc.running && lastProc.external
+        ? "无日志：服务为外部启动。将 --log 指向其日志文件，或用面板「启动」接管。"
+        : "无日志"
+    );
     if (atBottom) box.scrollTop = box.scrollHeight;
   } catch {}
 }
