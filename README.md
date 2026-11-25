@@ -63,7 +63,7 @@ python main.py
 python main.py --server-cmd "llama-server -m models/qwen.gguf --metrics"
 
 # 2. 面板接入 systemd 托管的 llama-server（局域网可访问）
-python main.py --host 0.0.0.0 --port 5000 --systemd-unit llama-server --log /home/ling/llama/server.log
+python main.py --host 0.0.0.0 --port 5000 --systemd-unit llama-server --log /var/log/llama-server.log
 
 # 3. Router 模式（空闲 10 分钟自动卸载模型，来请求自动唤醒）
 python main.py --server-cmd "llama-server --models-preset models.ini --models-autoload --sleep-idle-seconds 600 --metrics"
@@ -71,7 +71,7 @@ python main.py --server-cmd "llama-server --models-preset models.ini --models-au
 
 > 提示：`llama-server` 需启用 `--metrics`（或 `models.ini` 中配置 `metrics = true`），`/metrics` 才会返回数据。
 
-## Linux 生产部署参考（Ubuntu + systemd + Router）
+## Linux 部署参考（systemd + Router）
 
 ### 1. Router 模式 `models.ini` 示例
 
@@ -82,10 +82,10 @@ version = 1
 sleep-idle-seconds = 600
 metrics = true
 
-[qwen3.8-27b]
-model = /home/ling/models/llama/your-model.gguf
+[my-model]
+model = /path/to/models/model.gguf
 n-gpu-layers = 999
-ctx-size = 81920
+ctx-size = 65536
 cache-type-k = q8_0
 cache-type-v = q4_0
 parallel = 2
@@ -93,11 +93,11 @@ kv-unified = true
 flash-attn = on
 ```
 
-配合启动脚本：
+配合启动命令：
 
 ```bash
-exec ./llama-server \
-  --models-preset /home/ling/llama/models.ini \
+llama-server \
+  --models-preset /path/to/models.ini \
   --models-max 1 \
   --models-autoload \
   --sleep-idle-seconds 600 \
@@ -107,7 +107,7 @@ exec ./llama-server \
 
 ### 2. 配置 `llama-panel.service` 开机自启
 
-`/etc/systemd/system/llama-panel.service`：
+`/etc/systemd/system/llama-panel.service`（将 `<user>` 与 `/path/to/...` 替换为实际用户名与路径）：
 
 ```ini
 [Unit]
@@ -117,11 +117,11 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-User=ling
-Group=ling
-WorkingDirectory=/home/ling/llama/llama-panel
-Environment=PATH=/home/ling/bin:/usr/local/bin:/usr/bin:/bin
-ExecStart=/home/ling/llama/llama-panel/.venv/bin/python /home/ling/llama/llama-panel/main.py --host 0.0.0.0 --port 5000 --systemd-unit llama-server --log /home/ling/llama/server.log
+User=<user>
+Group=<user>
+WorkingDirectory=/path/to/llama-panel
+Environment=PATH=/home/<user>/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=/path/to/llama-panel/.venv/bin/python /path/to/llama-panel/main.py --host 0.0.0.0 --port 5000 --systemd-unit llama-server --log /var/log/llama-server.log
 Restart=on-failure
 RestartSec=3
 
@@ -144,7 +144,7 @@ sudo systemctl enable --now llama-panel.service
 polkit.addRule(function(action, subject) {
     if (action.id === "org.freedesktop.systemd1.manage-units" &&
         (action.lookup("unit") === "llama-server.service" || action.lookup("unit") === "llama-server") &&
-        subject.user === "ling") {
+        subject.user === "<user>") {
         return polkit.Result.YES;
     }
 });
