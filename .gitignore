@@ -23,3 +23,6 @@ htmlcov/
 # Secrets / env
 .env
 *.local
+
+# Runtime logs
+llama-server.log
