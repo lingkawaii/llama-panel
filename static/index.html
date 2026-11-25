@@ -191,7 +191,7 @@ function slotRows(s) {
     <td>${s.id ?? "?"}</td>
     <td><span class="tag ${busy ? "busy" : "idle"}">${busy ? "处理中" : "空闲"}</span></td>
     <td>${fmt(s.n_ctx)}</td>
-    <td>${fmt(s.n_prompt ?? sp.prompt_n)}</td>
+    <td>${fmt(s.n_prompt_tokens ?? sp.prompt_n)}</td>
     <td>${fmt(s.n_decoded ?? sp.decoded_n)}</td>
     <td>${fmt(sp.prompt_n_per_second, " tok/s")}</td>
     <td>${fmt(sp.decoded_n_per_second, " tok/s")}</td>
