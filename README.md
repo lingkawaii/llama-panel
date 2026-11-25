@@ -1,101 +1,189 @@
-# llama.cpp 监控与控制面板
+# llama.cpp 监控与控制面板 (`llama-panel`)
 
-基于 Flask 的本地面板：监控 llama-server 的运行状态、模型信息、GPU/VRAM、槽位与 Prometheus 指标，并可一键启动/停止/重启 llama-server 进程（支持 systemd 托管）。
+基于 Flask 的轻量级本地 `llama-server` 监控与控制面板（零前端依赖、仅依赖 `Flask` 与 `requests`）：实时监控服务状态、模型信息、GPU/VRAM、槽位与 Prometheus 指标，支持 `systemd` 托管启停、**Router 模式自动休眠/防误唤醒/一键卸载加载**，以及一键快速测速。
 
-## 功能
+## 核心功能
 
-- **服务控制**：启动 / 停止 / 重启 llama-server 子进程，显示 PID 与运行时长，日志落盘到 `llama-server.log`；停止/重启需二次确认，请求进行中按钮自动禁用
-- **systemd 托管**：`--systemd-unit` 指定 systemd 单元后，状态查询与启停/重启全部走 `systemctl`（非 root 无免密权限时返回 500 + 明确错误）；运行时长取自 `ActiveEnterTimestampMonotonic`（单调时钟，真实 uptime）
-- **模型信息**：来自 `GET /v1/models`（模型 ID、架构、上下文长度）
-- **显卡 / VRAM**：只读采集 GPU 型号、显存用量（带进度条，>85% 警告色、>95% 错误色）、GPU 利用率、温度、功耗；优先 `rocm-smi`（PATH 或 `~/bin/rocm-smi`），回退 `nvidia-smi`，2 秒超时，无 GPU 工具时优雅隐藏
-- **槽位状态**：来自 `GET /slots`（处理中/空闲、提示词与生成 tokens、实时速度）
-- **指标看板**：解析 `GET /metrics` 的 Prometheus 文本（`llamacpp:*` 指标），4×2 对称网格展示生成速度、提示词速度、spec 接受率、KV 缓存命中率、上下文高水位、处理中/排队请求、提示词/生成 tokens 累计；全量指标折叠收纳
-- **快速测速**：模型卡内一键测速按钮，向 `/v1/chat/completions` 发极短请求，返回耗时 / Prefill / Decode 速度 / MTP 接受率（`POST /api/probe`，失败返回 502 并内联提示）
-- **Router 模式适配**：自动识别 `--models-preset ... --models-autoload` 的 Router 模式（`/v1/models` 返回 `status` 字段），模型卡显示状态徽章（已加载/休眠中（已卸载）/加载中…）与自动休眠策略（如"空闲 10m 自动卸载"）；**防误唤醒**：仅 `loaded` 状态才请求 `/slots` 与 `/metrics`（Router 模式下这两端点必须带 `?model=`，`unloaded` 时被查询会触发 autoload 误唤醒），休眠时表格显示友好提示；支持**一键加载/卸载模型**（`POST /api/model/load` / `POST /api/model/unload`，对应上游 `POST /models/load` / `POST /models/unload`），卸载前二次确认，操作期间按钮禁用、失败内联红字提示
-- **实时趋势**：纯原生 SVG 双图（生成/提示词速度 + VRAM 占用/GPU 温度），保留最近 60 个采样点（约 2 分钟），无 GPU 数据时第二张图隐藏、第一张撑满整行
-- **日志查看器**：关键词搜索、告警/错误过滤、测速行过滤、100/200/500 行切换、暂停/恢复滚屏、一键复制当前过滤结果
-- **外部进程识别**：server 不是面板启动的也没关系——面板会按端口自动发现本机监听进程（Windows `netstat`，Linux `ss`/`lsof`），显示"运行中（外部）· PID"，并可直接停止
-- 单页深色界面，自动轮询刷新（状态 2s / 日志 5s），页头显示最后刷新时间并可手动刷新，无前端依赖，移动端自适应
+- **服务控制与 `systemd` 托管**：
+  - 支持直接托管 `llama-server` 子进程，或通过 `--systemd-unit` 接入 `systemd` 单元（`systemctl start/stop/restart`）；
+  - 真实运行时长 `uptime` 取自 `ActiveEnterTimestampMonotonic`（单调时钟）；
+  - 外部进程自动发现：即使服务不是面板拉起的，也会按端口自动识别本机进程（Windows `netstat` / Linux `ss`、`lsof`）；
+  - **页面内暗色确认弹窗**：所有危险操作（停止、重启、卸载模型）均使用页面内模态框确认（支持遮罩与 `Esc` 取消），避免原生 `window.confirm()` 在 IDE/Electron 内置 WebView 中被静默拦截。
+- **Router 模式与显存省电（防误唤醒）**：
+  - 自动识别 `--models-preset ... --models-autoload --sleep-idle-seconds <N>` 的 Router 模式，展示模型状态徽章（`已加载` / `休眠中（已卸载）` / `加载中…`）与空闲自动卸载策略（如 `空闲 10m 自动卸载`）；
+  - 支持一键 **「卸载模型」** 释放显存与 **「加载模型」** 手动唤醒（`POST /api/model/unload`、`/api/model/load`）；
+  - **并发防误唤醒机制**：后端通过 `threading.Lock` 串行化状态轮询与加载/卸载，并在卸载后启用 **5 秒冷却期**，冷却期及 `unloaded` 状态下绝不向 Router 发送 `?model=` 的 `/slots` 或 `/metrics` 请求，彻底防止多标签页轮询误触发 `--models-autoload`。
+- **模型信息与一键测速**：
+  - 展示模型 ID、上下文窗口 `n_ctx`、量化格式 `ftype`、参数量与文件大小；
+  - 模型卡内置 **「快速测速」** 按钮（`POST /api/probe`），发送极短对话探针并返回总耗时、Prefill、Decode 速度与 MTP 投机解码接受率。
+- **显卡 / VRAM 实时监控**：
+  - 只读采集显卡型号、VRAM 占用与颜色分级进度条（`>85%` 琥珀色、`>95%` 红色）、GPU 利用率、温度与功耗；
+  - 优先探测 `rocm-smi`（`PATH` 或 `~/bin/rocm-smi`），自动回退 `nvidia-smi`，2 秒超时保护，无 GPU 环境优雅降级。
+- **指标看板与原生 SVG 趋势图**：
+  - 4×2 对称网格卡片（移动端自动切换 2 列）：生成速度、提示词速度、spec 接受率、KV 缓存命中率、上下文高水位、处理中/排队请求、提示词/生成 tokens 累计；全量 Prometheus 指标默认折叠收纳；
+  - 纯原生 `<svg>` 实时双趋势图（吞吐趋势 + 显卡 VRAM/温度趋势，近 2 分钟 60 个采样点，零外部 CDN，离线可用）。
+- **槽位与运维日志查看器**：
+  - 槽位表展示并发槽位状态、上下文及吞吐速度（移动端单行横向滚动不折行）；
+  - 日志区支持关键词搜索（忽略大小写）、`全部` / `告警/错误` / `测速` 快捷过滤、`100 / 200 / 500` 行切换、暂停/恢复滚屏与一键复制。
 
-## 环境
+## 安装依赖
 
 ```bash
 python -m venv .venv
-.venv/Scripts/activate        # Windows
+
+# Windows (PowerShell)
+.venv\Scripts\Activate.ps1
+# Linux / macOS
+source .venv/bin/activate
+
 pip install -r requirements.txt
 ```
 
-## 使用
-
-启动面板（默认监听 `http://127.0.0.1:5000`）：
+## 快速启动
 
 ```bash
 python main.py
 ```
 
-常用参数：
+默认监听 `http://127.0.0.1:5000`，常用参数如下：
 
 | 参数 | 默认值 | 说明 |
 |---|---|---|
-| `--host` | `127.0.0.1` | 面板监听地址 |
+| `--host` | `127.0.0.1` | 面板监听地址（局域网访问填 `0.0.0.0`） |
 | `--port` | `5000` | 面板监听端口 |
-| `--server-url` | `http://127.0.0.1:8080` | llama-server 地址 |
-| `--server-cmd` | `llama-server` | 面板启动 llama-server 的命令（空格分隔） |
-| `--log` | `llama-server.log` | llama-server 日志文件 |
-| `--systemd-unit` | 无 | 用 systemd 单元管理 server（如 `llama-server.service`），启停/重启走 `systemctl` 而非面板拉起子进程 |
+| `--server-url` | `http://127.0.0.1:8080` | `llama-server` 地址 |
+| `--server-cmd` | `llama-server` | 面板直接拉起 `llama-server` 的命令（空格分隔） |
+| `--log` | `llama-server.log` | `llama-server` 日志文件路径（支持直接读取外部/systemd 日志） |
+| `--systemd-unit` | 无 | 指定 `systemd` 单元名（如 `llama-server`），启停与重启走 `systemctl` |
 
-示例——让面板管理一个带指标的 llama-server：
-
-```bash
-python main.py --server-cmd "llama-server -m models/qwen3-8b-q4.gguf --metrics"
-```
-
-示例——server 由 systemd 托管（单元文件 `ExecStart=... llama-server --metrics`）：
+### 启动示例
 
 ```bash
-python main.py --systemd-unit llama-server.service --log /var/log/llama-server.log
+# 1. 面板直接管理单模型 llama-server
+python main.py --server-cmd "llama-server -m models/qwen.gguf --metrics"
+
+# 2. 面板接入 systemd 托管的 llama-server（局域网可访问）
+python main.py --host 0.0.0.0 --port 5000 --systemd-unit llama-server --log /home/ling/llama/server.log
+
+# 3. Router 模式（空闲 10 分钟自动卸载模型，来请求自动唤醒）
+python main.py --server-cmd "llama-server --models-preset models.ini --models-autoload --sleep-idle-seconds 600 --metrics"
 ```
 
-> 注意 1：llama-server 需加 `--metrics` 启动，`/metrics` 端点才会返回数据（否则返回 501，面板显示"无指标"）。
-> 注意 2：`--systemd-unit` 模式下，面板用户需要有权执行 `systemctl start/stop/restart <unit>`（root 或配置了免密 polkit 规则），否则操作返回 500 并在页面内联提示原因。
-> 注意 3：Router 模式（`--models-preset ... --models-autoload --sleep-idle-seconds 600`）下，闲置超时的模型会自动卸载释放显存，来请求自动重新加载；面板会自动识别该模式，休眠时不轮询 `/slots`/`/metrics`（避免误唤醒），并可在模型卡一键加载/卸载。
+> 提示：`llama-server` 需启用 `--metrics`（或 `models.ini` 中配置 `metrics = true`），`/metrics` 才会返回数据。
 
-示例——Router 模式（多模型预设 + 自动加载/休眠）：
+## Linux 生产部署参考（Ubuntu + systemd + Router）
+
+### 1. Router 模式 `models.ini` 示例
+
+```ini
+version = 1
+
+[*]
+sleep-idle-seconds = 600
+metrics = true
+
+[qwen3.8-27b]
+model = /home/ling/models/llama/your-model.gguf
+n-gpu-layers = 999
+ctx-size = 81920
+cache-type-k = q8_0
+cache-type-v = q4_0
+parallel = 2
+kv-unified = true
+flash-attn = on
+```
+
+配合启动脚本：
 
 ```bash
-python main.py --server-cmd "llama-server --models-preset models.ini --models-autoload --sleep-idle-seconds 600"
+exec ./llama-server \
+  --models-preset /home/ling/llama/models.ini \
+  --models-max 1 \
+  --models-autoload \
+  --sleep-idle-seconds 600 \
+  --metrics \
+  --host 0.0.0.0 --port 8080
 ```
 
-## API
+### 2. 配置 `llama-panel.service` 开机自启
+
+`/etc/systemd/system/llama-panel.service`：
+
+```ini
+[Unit]
+Description=llama.cpp Monitoring and Control Panel
+After=network-online.target llama-server.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ling
+Group=ling
+WorkingDirectory=/home/ling/llama/llama-panel
+Environment=PATH=/home/ling/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=/home/ling/llama/llama-panel/.venv/bin/python /home/ling/llama/llama-panel/main.py --host 0.0.0.0 --port 5000 --systemd-unit llama-server --log /home/ling/llama/server.log
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
+```
+
+启用服务：
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable --now llama-panel.service
+```
+
+### 3. 最小权限 Polkit 规则（允许非 root 用户在网页一键启停）
+
+`/etc/polkit-1/rules.d/50-llama-panel.rules`（仅放行指定用户管理 `llama-server.service` 单个单元）：
+
+```javascript
+polkit.addRule(function(action, subject) {
+    if (action.id === "org.freedesktop.systemd1.manage-units" &&
+        (action.lookup("unit") === "llama-server.service" || action.lookup("unit") === "llama-server") &&
+        subject.user === "ling") {
+        return polkit.Result.YES;
+    }
+});
+```
+
+## HTTP API
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
-| GET | `/` | 面板页面 |
-| GET | `/api/status` | 聚合状态：health / models / model_state / 进程 / 槽位 / 指标 / gpu（Router 模式 `unloaded` 时 `slots=[]`、`metrics=null`，不请求上游） |
-| GET | `/api/logs?n=200` | llama-server 日志末尾 n 行 |
-| POST | `/api/model/load` | Router 模式加载模型（上游 `POST /models/load`）；body 可选 `{"model": "..."}`，缺省取当前 model_id；无 model_id 400，上游失败 502 |
-| POST | `/api/model/unload` | Router 模式卸载模型释放显存（上游 `POST /models/unload`）；参数与错误码同上 |
-| POST | `/api/server/start` | 启动 llama-server（已在运行返回 409；systemd 模式走 `systemctl start`） |
-| POST | `/api/server/stop` | 停止 llama-server（外部启动的按端口发现的 PID 终止；systemd 模式走 `systemctl stop`） |
-| POST | `/api/server/restart` | 重启 llama-server（面板模式先停后启；systemd 模式走 `systemctl restart`） |
-| POST | `/api/probe` | 一键快速测速：极短 chat 请求，返回耗时 / Prefill / Decode / MTP 接受率；失败 502 |
+| GET | `/` | 面板单页前端 |
+| GET | `/api/status` | 聚合状态：`health` / `models` / `model_state` / `process` / `slots` / `metrics` / `gpu`（Router `unloaded` 或卸载冷却期内不请求上游 `/slots` 与 `/metrics`） |
+| GET | `/api/logs?n=200` | 返回日志文件末尾 `n` 行 |
+| POST | `/api/model/load` | Router 模式手动加载模型（body 可选 `{"model": "..."}`，缺省取当前模型；无模型 400，上游失败 502） |
+| POST | `/api/model/unload` | Router 模式手动卸载模型并启动 5 秒防误唤醒冷却期（参数与状态码同上） |
+| POST | `/api/server/start` | 启动 `llama-server`（运行中 409；`systemd` 模式走 `systemctl start`） |
+| POST | `/api/server/stop` | 停止 `llama-server`（外部进程按端口发现 PID 终止；`systemd` 模式走 `systemctl stop`） |
+| POST | `/api/server/restart` | 重启 `llama-server`（面板模式先停后启；`systemd` 模式走 `systemctl restart`） |
+| POST | `/api/probe` | 一键快速测速探针，返回耗时、Prefill/Decode 速度与 MTP 接受率（失败 502） |
 
-## 结构
+## 项目结构
 
-```
-main.py              # 入口（参数解析）
+```text
+main.py              # CLI 入口与参数解析
 llama_panel/
-  app.py             # Flask 应用与 API（含 systemd 托管）
-  client.py          # llama-server HTTP 客户端 + Prometheus 解析 + 快速测速 probe + Router 状态解析/加载卸载
-  gpu.py             # GPU/VRAM 只读采集（rocm-smi / nvidia-smi）+ 纯函数解析
-  process.py         # 进程管理 + 按端口发现/终止外部进程
-static/index.html    # 单页面板
-fake_llama.py        # 测试用假 llama-server（--router 模拟 Router 模式：status 字段、?model= 必填、/models/load|unload、autoload 唤醒与误唤醒计数）
-test_e2e.py          # 端到端测试（外部进程识别 + 启停/重启 + 快速测速 + Router 模式 load/unload + GPU 解析、systemd uptime 与 parse_model_state 单测）
+  app.py             # Flask 应用、API 路由、systemd 托管与卸载并发防护（锁 + 冷却期）
+  client.py          # llama-server HTTP 客户端、Prometheus 解析、快速测速与 Router 控制
+  gpu.py             # GPU/VRAM 只读采集（rocm-smi / nvidia-smi）与纯函数解析
+  process.py         # 子进程管理与跨平台外部进程发现/终止
+static/index.html    # 零依赖深色单页面板（SVG 趋势图、日志查看器、页面内确认弹窗）
+fake_llama.py        # 模拟 llama-server（支持 --router 模式、误唤醒计数与 stale_loaded 钩子）
+test_e2e.py          # 单元测试与端到端测试（GPU/uptime/Router 解析、启停重启、探针、8 线程并发防误唤醒）
 ```
 
-## 测试
+## 运行测试
 
 ```bash
-.venv/Scripts/python.exe test_e2e.py
+# Windows
+.venv\Scripts\python.exe test_e2e.py
+
+# Linux / macOS
+.venv/bin/python test_e2e.py
 ```
