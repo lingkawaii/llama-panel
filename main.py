@@ -21,9 +21,17 @@ def main() -> None:
         help="启动 llama-server 的命令，空格分隔 (默认 llama-server)",
     )
     p.add_argument("--log", default="llama-server.log", help="llama-server 日志文件")
+    p.add_argument(
+        "--systemd-unit",
+        default=None,
+        help="用 systemd 单元管理 server（如 llama-server.service），"
+        "启停/重启走 systemctl，而非面板拉起子进程",
+    )
     args = p.parse_args()
 
-    app = create_app(args.server_url, args.server_cmd.split(), args.log)
+    app = create_app(
+        args.server_url, args.server_cmd.split(), args.log, args.systemd_unit
+    )
     app.run(host=args.host, port=args.port)
 
 
