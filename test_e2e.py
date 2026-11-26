@@ -302,6 +302,29 @@ def test_parse_model_state():
         "router_mode": True, "model_id": None, "state": "loaded",
         "sleep_idle_seconds": None,
     }
+
+    # 多模型 Router：优先选第一个 loaded（第 2 个模型），其次 loading
+    multi = {"data": [
+        {"id": "model-a", "status": {"value": "unloaded", "args": [], "preset": "m.ini"}},
+        {"id": "model-b", "status": {"value": "loaded",
+                                     "args": ["--sleep-idle-seconds", "600"],
+                                     "preset": "m.ini"}},
+    ]}
+    r = parse_model_state(multi)
+    assert r["router_mode"] is True
+    assert r["model_id"] == "model-b", r
+    assert r["state"] == "loaded", r
+    assert r["sleep_idle_seconds"] == 600, r
+
+    # 无 loaded 但有 loading → 选 loading
+    multi["data"][1]["status"]["value"] = "loading"
+    assert parse_model_state(multi)["model_id"] == "model-b"
+    assert parse_model_state(multi)["state"] == "loading"
+
+    # 全 unloaded → 兜底 data[0]
+    multi["data"][1]["status"]["value"] = "unloaded"
+    r = parse_model_state(multi)
+    assert r["model_id"] == "model-a" and r["state"] == "unloaded", r
     print("A) parse_model_state 单测通过")
 
 
@@ -342,6 +365,208 @@ def test_model_routes():
     finally:
         LlamaClient.models, LlamaClient.load_model, LlamaClient.unload_model = orig
     print("B) model load/unload 路由单测通过")
+
+
+def test_parse_models_list():
+    """纯函数单测：parse_models_list（多模型摘要 + modalities 默认值）。"""
+    from llama_panel.client import parse_models_list
+
+    # 非 Router 单模型：state loaded，modalities 默认 ["text"]
+    r = parse_models_list({"data": [{"id": "fake-model"}]})
+    assert r == [{"id": "fake-model", "state": "loaded",
+                  "sleep_idle_seconds": None, "meta": {}, "modalities": ["text"]}], r
+
+    # Router 多模型：state 来自 status.value，sleep_idle 来自 args
+    payload = {"data": [
+        {"id": "a", "status": {"value": "unloaded",
+                               "args": ["--sleep-idle-seconds", "600"],
+                               "preset": "m.ini"}},
+        {"id": "b", "status": {"value": "loaded",
+                               "args": ["--sleep-idle-seconds", "600"],
+                               "preset": "m.ini"},
+         "meta": {"n_ctx": 4096,
+                  "architecture": {"input_modalities": ["text", "image"]}}},
+    ]}
+    r = parse_models_list(payload)
+    assert len(r) == 2, r
+    assert r[0]["id"] == "a" and r[0]["state"] == "unloaded", r
+    assert r[0]["sleep_idle_seconds"] == 600, r
+    assert r[0]["modalities"] == ["text"], r
+    assert r[1]["id"] == "b" and r[1]["state"] == "loaded", r
+    assert r[1]["modalities"] == ["text", "image"], r
+    assert r[1]["meta"]["n_ctx"] == 4096, r
+
+    # 空 / 非法输入
+    assert parse_models_list(None) == []
+    assert parse_models_list({}) == []
+    assert parse_models_list({"data": []}) == []
+    print("parse_models_list 单测通过")
+
+
+def test_update_sleep_idle_in_ini():
+    """纯函数单测：update_sleep_idle_in_ini（改值/关闭/无 [*] 节插入）。"""
+    from llama_panel.preset import update_sleep_idle_in_ini
+
+    # 已有 [*] 节：原地替换，保留其余行
+    ini = "version = 1\n\n[*]\nsleep-idle-seconds = 600\nmodel-a = /path/a.gguf\n"
+    out = update_sleep_idle_in_ini(ini, 300)
+    assert "sleep-idle-seconds = 300" in out, out
+    assert "sleep-idle-seconds = 600" not in out, out
+    assert "model-a = /path/a.gguf" in out, out
+
+    # <= 0 → 写入 -1（关闭自动休眠）
+    out = update_sleep_idle_in_ini(ini, 0)
+    assert "sleep-idle-seconds = -1" in out, out
+
+    # [*] 节内无该行：追加到节末尾
+    ini_b = "version = 1\n\n[*]\nmodel-a = /path/a.gguf\n"
+    out = update_sleep_idle_in_ini(ini_b, 900)
+    assert "sleep-idle-seconds = 900" in out, out
+    assert "model-a = /path/a.gguf" in out, out
+
+    # 无 [*] 节：在 version = 1 行后插入，保留其余节
+    ini2 = "version = 1\n\n[other]\nfoo = bar\n"
+    out = update_sleep_idle_in_ini(ini2, 900)
+    assert out.index("[*]") > out.index("version = 1"), out
+    assert "sleep-idle-seconds = 900" in out, out
+    assert "[other]" in out and "foo = bar" in out, out
+
+    # 无 version 行：插入到文件开头
+    ini3 = "[other]\nfoo = bar\n"
+    out = update_sleep_idle_in_ini(ini3, 120)
+    assert out.startswith("[*]"), out
+    assert "sleep-idle-seconds = 120" in out, out
+    print("update_sleep_idle_in_ini 单测通过")
+
+
+def test_parse_power_profiles():
+    """纯函数单测：parse_power_profiles（daemon 块 / 简单列表 / 非法文本）。"""
+    from llama_panel.power import parse_power_profiles
+
+    # daemon 块格式：激活项行首带 *
+    text = (
+        "  power-saver:\n"
+        "  CpuDriver: intel_pstate\n"
+        "* balanced:\n"
+        "  CpuDriver: intel_pstate\n"
+        "  performance:\n"
+    )
+    current, available = parse_power_profiles(text)
+    assert current == "balanced", (current, available)
+    assert set(available) == {"power-saver", "balanced", "performance"}, available
+
+    # 两档位块
+    cur2, avail2 = parse_power_profiles("* performance:\n  x: y\n  power-saver:\n")
+    assert cur2 == "performance", (cur2, avail2)
+    assert set(avail2) == {"performance", "power-saver"}, avail2
+
+    # 简单列表格式：- name / - * name
+    cur3, avail3 = parse_power_profiles("- power-saver\n- * balanced\n- performance\n")
+    assert cur3 == "balanced", (cur3, avail3)
+    assert set(avail3) == {"power-saver", "balanced", "performance"}, avail3
+
+    # 非法文本（无识别到的档位）
+    assert parse_power_profiles("no profiles here") == (None, [])
+    assert parse_power_profiles("") == (None, [])
+    print("parse_power_profiles 单测通过")
+
+
+def test_preset_sleep_idle_e2e():
+    """单测：/api/preset/sleep-idle（在线修改 models.ini 预设文件）。"""
+    from llama_panel.app import create_app
+
+    tmp = os.path.join(HERE, "test_preset.ini")
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write("version = 1\n\n[*]\nsleep-idle-seconds = 600\nmodel = /path/a.gguf\n")
+    try:
+        app = create_app("http://127.0.0.1:9", ["fake"],
+                         log_path=os.path.join(HERE, "test_preset.log"),
+                         models_preset=tmp)
+        c = app.test_client()
+
+        # 正常修改 → 200，文件更新
+        r = c.post("/api/preset/sleep-idle", json={"seconds": 300, "restart": False})
+        assert r.status_code == 200 and r.get_json()["ok"] is True, r.get_json()
+        with open(tmp, encoding="utf-8") as f:
+            assert "sleep-idle-seconds = 300" in f.read()
+
+        # 0 → 按 -1 处理（关闭）
+        r = c.post("/api/preset/sleep-idle", json={"seconds": 0, "restart": False})
+        assert r.status_code == 200 and r.get_json()["seconds"] == -1, r.get_json()
+        with open(tmp, encoding="utf-8") as f:
+            assert "sleep-idle-seconds = -1" in f.read()
+
+        # 越界 / 布尔 → 400
+        r = c.post("/api/preset/sleep-idle", json={"seconds": 30, "restart": False})
+        assert r.status_code == 400, r.status_code
+        r = c.post("/api/preset/sleep-idle", json={"seconds": 99999, "restart": False})
+        assert r.status_code == 400, r.status_code
+        r = c.post("/api/preset/sleep-idle", json={"seconds": True, "restart": False})
+        assert r.status_code == 400, r.status_code
+    finally:
+        for f in (tmp, os.path.join(HERE, "test_preset.log")):
+            try:
+                os.remove(f)
+            except OSError:
+                pass
+
+    # 未配置 --models-preset → 400
+    app2 = create_app("http://127.0.0.1:9", ["fake"],
+                      log_path=os.path.join(HERE, "test_preset2.log"))
+    c2 = app2.test_client()
+    r = c2.post("/api/preset/sleep-idle", json={"seconds": 300, "restart": False})
+    assert r.status_code == 400, r.status_code
+    try:
+        os.remove(os.path.join(HERE, "test_preset2.log"))
+    except OSError:
+        pass
+    print("preset sleep-idle 路由单测通过")
+
+
+def test_power_auto_e2e():
+    """单测：/api/power/auto（模型休眠自动切省电联动）。"""
+    import llama_panel.app as appmod
+    from llama_panel.app import create_app
+    from llama_panel.client import LlamaClient
+
+    calls = []
+    orig = (appmod.get_power_status, appmod.set_power_profile, LlamaClient.models)
+    try:
+        appmod.get_power_status = lambda: {
+            "current": "performance",
+            "available": ["power-saver", "balanced", "performance"],
+            "can_suspend": False,
+        }
+        appmod.set_power_profile = lambda profile: (
+            calls.append(profile), {"ok": True, "profile": profile})[1]
+        # 无已加载模型 → 开启时应切 power-saver
+        LlamaClient.models = lambda self: {"data": [
+            {"id": "model-a", "status": {"value": "unloaded",
+                                         "args": [], "preset": "m.ini"}},
+        ]}
+        app = create_app("http://127.0.0.1:9", ["fake"],
+                         log_path=os.path.join(HERE, "test_power.log"))
+        c = app.test_client()
+
+        r = c.post("/api/power/auto", json={"enabled": True})
+        assert r.status_code == 200 and r.get_json()["ok"] is True, r.get_json()
+        assert r.get_json()["enabled"] is True, r.get_json()
+        assert calls == ["power-saver"], calls
+
+        # 关闭 → ok，enabled False
+        r = c.post("/api/power/auto", json={"enabled": False})
+        assert r.status_code == 200 and r.get_json()["enabled"] is False, r.get_json()
+
+        # enabled 非布尔 → 400
+        r = c.post("/api/power/auto", json={"enabled": "yes"})
+        assert r.status_code == 400, r.status_code
+    finally:
+        appmod.get_power_status, appmod.set_power_profile, LlamaClient.models = orig
+        try:
+            os.remove(os.path.join(HERE, "test_power.log"))
+        except OSError:
+            pass
+    print("power auto 路由单测通过")
 
 
 def test_router_e2e():
@@ -478,11 +703,88 @@ def test_router_cooldown():
     print("10c) 冷却期后恢复指标查询:", dbg)
 
 
+def test_multi_model_e2e(fake2):
+    """多模型 Router 端到端：每模型独立 load/unload，status 指向已加载模型。
+
+    杀掉传入的 router fake，启动双模型 fake（model-a / model-b），
+    返回新 fake 进程供 main() 的 finally 回收。
+    """
+    if fake2 is not None:
+        fake2.kill()
+        try:
+            fake2.wait(timeout=5)
+        except (subprocess.TimeoutExpired, OSError):
+            pass
+    wait_port_free(FAKE_PORT)
+    if os.path.exists(PID_FILE):
+        os.remove(PID_FILE)
+    fake_log = open(os.path.join(HERE, "test_fake_mm.log"), "ab")
+    fake3 = subprocess.Popen(
+        [PY, "fake_llama.py", "--router", "--model", "model-a", "--model", "model-b"],
+        cwd=HERE, stdout=fake_log, stderr=fake_log)
+    wait_pid_file(what="multi-model fake pid")
+    print("11) 多模型 fake server 已启动")
+
+    # 11a) models_list 两项，均 unloaded；不触发 /slots /metrics
+    s = wait_status(
+        lambda d: len((d["server"].get("models_list") or [])) == 2
+        and (d["server"].get("model_state") or {}).get("state") == "unloaded",
+        "multi-model initial status",
+    )
+    ml = s["server"]["models_list"]
+    assert {m["id"] for m in ml} == {"model-a", "model-b"}, ml
+    assert all(m["state"] == "unloaded" for m in ml), ml
+    assert s["slots"] == [] and s["metrics"] is None, s
+    print("11a) 初始双模型 unloaded ok")
+
+    # 11b) 加载 model-b → status 指向 model-b，slots/metrics 非空，无误唤醒
+    code, d = post_json("/api/model/load", {"model": "model-b"})
+    assert code == 200 and d.get("ok") is True, f"load model-b 应成功: {code} {d}"
+    s = wait_status(
+        lambda d: (d["server"].get("model_state") or {}).get("model_id") == "model-b"
+        and (d["server"].get("model_state") or {}).get("state") == "loaded",
+        "model-b loaded",
+    )
+    ms = s["server"]["model_state"]
+    assert ms["model_id"] == "model-b", ms
+    assert ms["state"] == "loaded", ms
+    assert s["slots"], f"loaded 应返回 slots: {s['slots']}"
+    assert s["metrics"], f"loaded 应返回 metrics: {s['metrics']}"
+    by_id = {m["id"]: m for m in s["server"]["models_list"]}
+    assert by_id["model-b"]["state"] == "loaded", by_id
+    assert by_id["model-a"]["state"] == "unloaded", by_id
+    dbg = fake_get("/debug")
+    assert dbg["models"]["model-b"] == "loaded" and dbg["models"]["model-a"] == "unloaded", dbg
+    assert dbg["slots_misfires"] == 0 and dbg["metrics_misfires"] == 0, dbg
+    print("11b) model-b loaded ok:", ms)
+
+    # 11c) 卸载 model-b → 回落到 model-a / unloaded
+    code, d = post_json("/api/model/unload", {"model": "model-b"})
+    assert code == 200 and d.get("ok") is True, f"unload model-b 应成功: {code} {d}"
+    s = wait_status(
+        lambda d: (d["server"].get("model_state") or {}).get("state") == "unloaded",
+        "model-b unloaded",
+    )
+    ms = s["server"]["model_state"]
+    assert ms["model_id"] == "model-a", ms
+    assert ms["state"] == "unloaded", ms
+    assert s["slots"] == [] and s["metrics"] is None, s
+    dbg = fake_get("/debug")
+    assert dbg["models"]["model-b"] == "unloaded", dbg
+    print("11c) model-b unloaded ok:", ms)
+    return fake3
+
+
 def main():
     test_gpu_parsers()
     test_parse_systemd_uptime()
     test_parse_model_state()
+    test_parse_models_list()
+    test_update_sleep_idle_in_ini()
+    test_parse_power_profiles()
     test_model_routes()
+    test_preset_sleep_idle_e2e()
+    test_power_auto_e2e()
 
     for p in (FAKE_PORT, PANEL_PORT):
         assert not port_in_use(p), f"端口 {p} 已被占用，先清理残留进程"
@@ -497,6 +799,7 @@ def main():
          "--server-cmd", f"{PY} fake_llama.py"],
         cwd=HERE, stdout=panel_log, stderr=panel_log)
     fake2 = None
+    fake3 = None
     try:
         # 0) 假 server 的真实 pid（本环境 Popen.pid 可能与子进程实际 pid 不同）
         deadline = time.time() + 10
@@ -597,9 +900,12 @@ def main():
         # 10) 冷却期/并发防误唤醒
         test_router_cooldown()
 
+        # 11) 多模型 Router 切换
+        fake3 = test_multi_model_e2e(fake2)
+
         print("\nALL E2E CHECKS PASSED")
     finally:
-        for proc in (panel, fake2, fake):
+        for proc in (panel, fake3, fake2, fake):
             if proc is None:
                 continue
             try:

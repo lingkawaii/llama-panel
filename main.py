@@ -27,10 +27,19 @@ def main() -> None:
         help="用 systemd 单元管理 server（如 llama-server.service），"
         "启停/重启走 systemctl，而非面板拉起子进程",
     )
+    p.add_argument(
+        "--models-preset",
+        default=None,
+        help="models.ini 预设文件路径（配置后支持在线修改空闲休眠时长）",
+    )
     args = p.parse_args()
 
     app = create_app(
-        args.server_url, args.server_cmd.split(), args.log, args.systemd_unit
+        args.server_url,
+        args.server_cmd.split(),
+        args.log,
+        args.systemd_unit,
+        models_preset=args.models_preset,
     )
     app.run(host=args.host, port=args.port)
 

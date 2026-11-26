@@ -35,6 +35,7 @@
   button:hover { border-color: var(--accent); }
   button:disabled { opacity: .5; cursor: default; }
   button.danger:hover { border-color: var(--err); }
+  button.power-btn.active { border-color: var(--accent); color: var(--accent); }
   .table-wrap { overflow-x: auto; }
   table { width: 100%; border-collapse: collapse; font-size: 13px; }
   th, td { text-align: left; padding: 6px 10px; border-bottom: 1px solid var(--border);
@@ -132,6 +133,11 @@
     <div class="card" id="gpu-card"><span class="muted">加载中…</span></div>
   </section>
 
+  <section id="power-section" class="hidden">
+    <h2>电源与省电</h2>
+    <div class="card" id="power-card"><span class="muted">加载中…</span></div>
+  </section>
+
   <section>
     <h2>指标</h2>
     <div class="metrics-grid" id="metric-cards"></div>
@@ -214,6 +220,7 @@ let probing = false;    // 测速请求进行中
 let probeResultHtml = ""; // 测速结果展示
 let modelBusy = null;   // 模型加载/卸载进行中：null | "loading" | "unloading"
 let modelErrHtml = "";  // 模型卡操作错误内联展示
+let sleepIdleSel = null; // 空闲自动卸载下拉框选中值（null=跟随后端当前值）
 let logLines = [];    // 最近一次拉取的日志行
 let logFilter = "all"; // all | warn | speed
 let logSearch = "";
@@ -414,6 +421,148 @@ function renderGpu(g) {
     <div class="sub">${sub}</div>`;
 }
 
+// ---- 多模型 Router：单行渲染 ----
+function modelRowHtml(m) {
+  const state = m.state || "none";
+  const badge = state === "loaded"
+    ? `<span class="tag loaded">已加载</span>`
+    : state === "unloaded"
+      ? `<span class="tag sleeping">休眠中</span>`
+      : state === "loading"
+        ? `<span class="tag loading">加载中…</span>`
+        : "";
+  const vision = (m.modalities || []).includes("image")
+    ? `<span class="tag" style="background:rgba(88,166,255,.15);color:var(--accent)">视觉</span>` : "";
+  const meta = m.meta || {};
+  const sub = state === "unloaded"
+    ? "显存已释放，收到请求将自动唤醒"
+    : [
+        meta.n_ctx ? `n_ctx ${fmt(meta.n_ctx)}` : null,
+        meta.ftype || null,
+        meta.n_params ? `${fmtBig(meta.n_params)} 参数` : null,
+        meta.size ? fmtBytes(meta.size) : null,
+      ].filter(Boolean).join(" · ") || "—";
+  const inAction = modelBusy !== null;
+  const btnLoad = state !== "loaded"
+    ? `<button class="mm-load" data-model="${escHtml(m.id)}" ${inAction || state === "loading" ? "disabled" : ""}>加载</button>`
+    : "";
+  const btnUnload = state !== "unloaded"
+    ? `<button class="mm-unload danger" data-model="${escHtml(m.id)}" ${inAction || state === "loading" ? "disabled" : ""}>卸载</button>`
+    : "";
+  const btnProbe = `<button class="mm-probe" data-model="${escHtml(m.id)}" ${probing || inAction || !lastHealth ? "disabled" : ""}>测速</button>`;
+  return `<div class="row" style="margin-bottom:8px">
+    <div style="flex:1;min-width:0">
+      <div class="value" style="font-size:14px">${escHtml(m.id)} ${badge} ${vision}</div>
+      <div class="sub">${sub}</div>
+    </div>
+    <span class="actions">${btnLoad}${btnUnload}${btnProbe}</span>
+  </div>`;
+}
+
+// ---- 电源与省电 ----
+function renderPower(p) {
+  const section = $("power-section");
+  const el = $("power-card");
+  if (!p) { section.classList.add("hidden"); return; }
+  section.classList.remove("hidden");
+  const cur = p.current;
+  const avail = p.available || [];
+  const nameMap = { "power-saver": "省电", "balanced": "平衡", "performance": "性能" };
+  const btns = avail.length
+    ? avail.map((name) =>
+        `<button class="power-btn ${name === cur ? "active" : ""}" data-profile="${name}">${nameMap[name] || name}</button>`
+      ).join("")
+    : `<span class="muted">（无可用档位）</span>`;
+  const suspendBtn = p.can_suspend
+    ? `<button id="btn-suspend" class="danger">整机休眠</button>` : "";
+  el.innerHTML = `
+    <div class="row">
+      <span class="label">电源档位</span>
+      ${btns}
+      <span style="flex:1"></span>
+      ${suspendBtn}
+    </div>
+    <div class="row" style="margin-top:10px">
+      <label style="display:flex;align-items:center;gap:6px;cursor:pointer">
+        <input type="checkbox" id="chk-auto-power" ${p.auto_power_saver ? "checked" : ""}> 模型休眠自动切省电
+      </label>
+    </div>
+    <div id="power-err"></div>`;
+}
+
+async function setPowerProfile(profile) {
+  const errEl = $("power-err");
+  if (errEl) errEl.innerHTML = "";
+  try {
+    const r = await fetch("/api/power/profile", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ profile }),
+    });
+    const d = await r.json();
+    if (!d.ok) errEl.innerHTML = `<div class="err-bar">${escHtml(d.error || `请求失败（HTTP ${r.status}）`)}</div>`;
+  } catch (e) {
+    if (errEl) errEl.innerHTML = `<div class="err-bar">${escHtml(`请求失败: ${e}`)}</div>`;
+  }
+  fetchStatus();
+}
+
+async function toggleAutoPower(enabled) {
+  const errEl = $("power-err");
+  if (errEl) errEl.innerHTML = "";
+  try {
+    const r = await fetch("/api/power/auto", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ enabled }),
+    });
+    const d = await r.json();
+    if (!d.ok) errEl.innerHTML = `<div class="err-bar">${escHtml(d.error || `请求失败（HTTP ${r.status}）`)}</div>`;
+  } catch (e) {
+    if (errEl) errEl.innerHTML = `<div class="err-bar">${escHtml(`请求失败: ${e}`)}</div>`;
+  }
+  fetchStatus();
+}
+
+async function doSuspend() {
+  if (!(await askConfirm("确认让主机进入 S3 深度休眠？休眠前会自动卸载模型，之后需通过 Wake-on-LAN 或电源键唤醒。"))) return;
+  const errEl = $("power-err");
+  if (errEl) errEl.innerHTML = "";
+  const btn = $("btn-suspend");
+  if (btn) { btn.disabled = true; btn.textContent = "休眠中…"; }
+  try {
+    const r = await fetch("/api/power/suspend", { method: "POST" });
+    const d = await r.json();
+    if (!d.ok) errEl.innerHTML = `<div class="err-bar">${escHtml(d.error || `请求失败（HTTP ${r.status}）`)}</div>`;
+  } catch (e) {
+    if (errEl) errEl.innerHTML = `<div class="err-bar">${escHtml(`请求失败: ${e}`)}</div>`;
+  }
+  const b = $("btn-suspend");
+  if (b) { b.disabled = false; b.textContent = "整机休眠"; }
+}
+
+async function applySleepIdle() {
+  const sel = $("sel-sleep-idle");
+  if (!sel) return;
+  const seconds = parseInt(sel.value, 10);
+  if (!(await askConfirm("确认修改空闲自动卸载时长并重启服务？"))) return;
+  const btn = $("btn-apply-sleep-idle");
+  if (btn) btn.disabled = true;
+  modelErrHtml = "";
+  try {
+    const r = await fetch("/api/preset/sleep-idle", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ seconds, restart: true }),
+    });
+    const d = await r.json();
+    if (!d.ok) modelErrHtml = `<span style="color:var(--err)">${escHtml(d.error || `请求失败（HTTP ${r.status}）`)}</span>`;
+    else sleepIdleSel = null;
+  } catch (e) {
+    modelErrHtml = `<span style="color:var(--err)">${escHtml(`请求失败: ${e}`)}</span>`;
+  }
+  const b = $("btn-apply-sleep-idle");
+  if (b) b.disabled = false;
+  fetchStatus();
+}
+
 function renderStatus(data) {
   const s = data.server, p = s.process;
   lastProc = p;
@@ -437,49 +586,81 @@ function renderStatus(data) {
   const router = !!ms.router_mode;
   const mstate = ms.state || "none";
   const meta = s.models?.data?.[0]?.meta || {};
-  const badge = mstate === "loaded"
-    ? `<span class="tag loaded">已加载</span>`
-    : mstate === "unloaded"
-      ? `<span class="tag sleeping">休眠中（已卸载）</span>`
-      : mstate === "loading"
-        ? `<span class="tag loading">加载中…</span>`
-        : "";
-  const subParts = mstate === "unloaded"
-    ? ["显存已释放，收到请求将自动唤醒"]
-    : [
-        `n_ctx ${fmt(meta.n_ctx)}`,
-        meta.ftype || null,
-        meta.n_params ? `${fmtBig(meta.n_params)} 参数` : null,
-        meta.size ? fmtBytes(meta.size) : null,
-      ];
-  if (ms.sleep_idle_seconds) subParts.push(`空闲 ${fmtSleep(ms.sleep_idle_seconds)} 自动卸载`);
-  const subs = subParts.filter(Boolean);
+  const modelsList = s.models_list || [];
   const inAction = modelBusy !== null;
-  const btnLoad = router && mstate !== "loaded"
-    ? `<button id="btn-load-model" ${inAction || mstate === "loading" ? "disabled" : ""}>${modelBusy === "loading" ? "加载中…" : "加载模型"}</button>`
-    : "";
-  const btnUnload = router && mstate !== "unloaded"
-    ? `<button id="btn-unload-model" class="danger" ${inAction || mstate === "loading" ? "disabled" : ""}>${modelBusy === "unloading" ? "卸载中…" : "卸载模型"}</button>`
-    : "";
-  $("model-card").innerHTML = mid
-    ? `<div class="row">
-         <div style="flex:1;min-width:0">
-           <div class="label">模型</div>
-           <div class="value" style="font-size:16px">${escHtml(mid)} ${badge}</div>
-           <div class="sub">${subs.join(" · ")}</div>
-         </div>
-         <span class="actions">
-           ${btnLoad}
-           ${btnUnload}
-           <button id="btn-probe" ${probing || inAction || !s.health ? "disabled" : ""}>${probing ? "测速中…" : "快速测速"}</button>
-         </span>
-       </div>
-       <div class="sub" id="model-action-err">${modelErrHtml}</div>
-       <div class="sub" id="probe-result">${probeResultHtml}</div>`
-    : `<span class="muted">无模型信息（服务未启动或未加载模型）</span>`;
+
+  let modelContent;
+  if (modelsList.length > 1) {
+    // 多模型 Router：每模型一行
+    modelContent = `<div class="label">模型（多模型 Router）</div>`
+      + modelsList.map(modelRowHtml).join("");
+  } else {
+    const badge = mstate === "loaded"
+      ? `<span class="tag loaded">已加载</span>`
+      : mstate === "unloaded"
+        ? `<span class="tag sleeping">休眠中（已卸载）</span>`
+        : mstate === "loading"
+          ? `<span class="tag loading">加载中…</span>`
+          : "";
+    const subParts = mstate === "unloaded"
+      ? ["显存已释放，收到请求将自动唤醒"]
+      : [
+          `n_ctx ${fmt(meta.n_ctx)}`,
+          meta.ftype || null,
+          meta.n_params ? `${fmtBig(meta.n_params)} 参数` : null,
+          meta.size ? fmtBytes(meta.size) : null,
+        ];
+    if (ms.sleep_idle_seconds) subParts.push(`空闲 ${fmtSleep(ms.sleep_idle_seconds)} 自动卸载`);
+    const subs = subParts.filter(Boolean);
+    const btnLoad = router && mstate !== "loaded"
+      ? `<button id="btn-load-model" ${inAction || mstate === "loading" ? "disabled" : ""}>${modelBusy === "loading" ? "加载中…" : "加载模型"}</button>`
+      : "";
+    const btnUnload = router && mstate !== "unloaded"
+      ? `<button id="btn-unload-model" class="danger" ${inAction || mstate === "loading" ? "disabled" : ""}>${modelBusy === "unloading" ? "卸载中…" : "卸载模型"}</button>`
+      : "";
+    modelContent = mid
+      ? `<div class="row">
+           <div style="flex:1;min-width:0">
+             <div class="label">模型</div>
+             <div class="value" style="font-size:16px">${escHtml(mid)} ${badge}</div>
+             <div class="sub">${subs.join(" · ")}</div>
+           </div>
+           <span class="actions">
+             ${btnLoad}
+             ${btnUnload}
+             <button id="btn-probe" ${probing || inAction || !s.health ? "disabled" : ""}>${probing ? "测速中…" : "快速测速"}</button>
+           </span>
+         </div>`
+      : `<span class="muted">无模型信息（服务未启动或未加载模型）</span>`;
+  }
+
+  // 空闲自动卸载（在线编辑 models.ini 预设）
+  let sleepIdleHtml = "";
+  if (s.preset_editable) {
+    const cur = sleepIdleSel !== null ? sleepIdleSel : ms.sleep_idle_seconds;
+    const opts = [[300, "5分钟"], [600, "10分钟"], [1800, "30分钟"], [3600, "60分钟"], [-1, "关闭"]];
+    if (cur !== null && cur !== undefined && !opts.some(([v]) => v === cur)) {
+      opts.push([cur, fmtSleep(cur)]);
+    }
+    sleepIdleHtml = `<div class="row" style="margin-top:10px">
+      <span class="label">空闲自动卸载</span>
+      <select id="sel-sleep-idle">
+        ${opts.map(([v, l]) => `<option value="${v}" ${cur === v ? "selected" : ""}>${l}</option>`).join("")}
+      </select>
+      <button id="btn-apply-sleep-idle">应用并重启</button>
+    </div>`;
+  }
+
+  $("model-card").innerHTML = modelContent
+    + `<div class="sub" id="model-action-err">${modelErrHtml}</div>`
+    + `<div class="sub" id="probe-result">${probeResultHtml}</div>`
+    + sleepIdleHtml;
 
   // 显卡 / VRAM
   renderGpu(data.gpu);
+
+  // 电源与省电（非 Linux 或无工具时 power 为 null，整卡隐藏）
+  renderPower(data.power);
 
   // 指标卡：固定 4×2 布局
   const m = data.metrics;
@@ -674,7 +855,7 @@ function probeLine(d) {
   return parts.join(" · ");
 }
 
-async function runProbe() {
+async function runProbe(model) {
   if (probing) return;
   probing = true;
   probeResultHtml = '<span class="muted">测速中…</span>';
@@ -683,7 +864,11 @@ async function runProbe() {
   const res = $("probe-result");
   if (res) res.innerHTML = probeResultHtml;
   try {
-    const r = await fetch("/api/probe", { method: "POST" });
+    const r = await fetch("/api/probe", {
+      method: "POST",
+      headers: model ? { "Content-Type": "application/json" } : undefined,
+      body: model ? JSON.stringify({ model }) : undefined,
+    });
     const d = await r.json();
     probeResultHtml = d.ok
       ? `<span class="muted">${probeLine(d)}</span>`
@@ -699,7 +884,7 @@ async function runProbe() {
 }
 
 // ---- 模型卡加载/卸载（Router 模式）----
-async function modelAction(kind) {
+async function modelAction(kind, model) {
   if (modelBusy) return;
   const confirmMsg = kind === "unloading"
     ? "确认立即卸载模型释放显存？下次收到请求会自动重新加载。"
@@ -711,7 +896,11 @@ async function modelAction(kind) {
   if (btn) { btn.textContent = kind === "unloading" ? "卸载中…" : "加载中…"; btn.disabled = true; }
   try {
     const path = kind === "loading" ? "/api/model/load" : "/api/model/unload";
-    const r = await fetch(path, { method: "POST" });
+    const r = await fetch(path, {
+      method: "POST",
+      headers: model ? { "Content-Type": "application/json" } : undefined,
+      body: model ? JSON.stringify({ model }) : undefined,
+    });
     const d = await r.json();
     if (!d.ok) {
       modelErrHtml = `<span style="color:var(--err)">${escHtml(d.error || `请求失败（HTTP ${r.status}）`)}</span>`;
@@ -727,6 +916,21 @@ $("model-card").addEventListener("click", (e) => {
   if (e.target.id === "btn-probe" && !e.target.disabled) runProbe();
   if (e.target.id === "btn-load-model" && !e.target.disabled) modelAction("loading");
   if (e.target.id === "btn-unload-model" && !e.target.disabled) modelAction("unloading");
+  // 多模型行
+  if (e.target.classList.contains("mm-probe") && !e.target.disabled) runProbe(e.target.dataset.model);
+  if (e.target.classList.contains("mm-load") && !e.target.disabled) modelAction("loading", e.target.dataset.model);
+  if (e.target.classList.contains("mm-unload") && !e.target.disabled) modelAction("unloading", e.target.dataset.model);
+  if (e.target.id === "btn-apply-sleep-idle" && !e.target.disabled) applySleepIdle();
+});
+$("model-card").addEventListener("change", (e) => {
+  if (e.target.id === "sel-sleep-idle") sleepIdleSel = parseInt(e.target.value, 10);
+});
+$("power-card").addEventListener("click", (e) => {
+  if (e.target.classList.contains("power-btn") && !e.target.disabled) setPowerProfile(e.target.dataset.profile);
+  if (e.target.id === "btn-suspend" && !e.target.disabled) doSuspend();
+});
+$("power-card").addEventListener("change", (e) => {
+  if (e.target.id === "chk-auto-power") toggleAutoPower(e.target.checked);
 });
 
 $("btn-refresh").onclick = () => { fetchStatus(); fetchLogs(); };

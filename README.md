@@ -10,9 +10,14 @@
   - 外部进程自动发现：即使服务不是面板拉起的，也会按端口自动识别本机进程（Windows `netstat` / Linux `ss`、`lsof`）；
   - **页面内暗色确认弹窗**：所有危险操作（停止、重启、卸载模型）均使用页面内模态框确认（支持遮罩与 `Esc` 取消），避免原生 `window.confirm()` 在 IDE/Electron 内置 WebView 中被静默拦截。
 - **Router 模式与显存省电（防误唤醒）**：
-  - 自动识别 `--models-preset ... --models-autoload --sleep-idle-seconds <N>` 的 Router 模式，展示模型状态徽章（`已加载` / `休眠中（已卸载）` / `加载中…`）与空闲自动卸载策略（如 `空闲 10m 自动卸载`）；
+  - 自动识别 `--models-preset ... --models-autoload --sleep-idle-seconds <N>` 的 Router 模式，支持**多模型/多预设列表展示与一键切换**，展示模型状态徽章（`已加载` / `休眠中` / `加载中…`）、多模态 `视觉` 标记与空闲自动卸载策略；
+  - 传入 `--models-preset` 后支持在页面内**在线修改空闲自动卸载时长**（`5m / 10m / 30m / 60m / 关闭`）并一键重启生效；
   - 支持一键 **「卸载模型」** 释放显存与 **「加载模型」** 手动唤醒（`POST /api/model/unload`、`/api/model/load`）；
   - **并发防误唤醒机制**：后端通过 `threading.Lock` 串行化状态轮询与加载/卸载，并在卸载后启用 **5 秒冷却期**，冷却期及 `unloaded` 状态下绝不向 Router 发送 `?model=` 的 `/slots` 或 `/metrics` 请求，彻底防止多标签页轮询误触发 `--models-autoload`。
+- **整机省电闭环（Linux）**：
+  - 接入 `power-profiles-daemon`（`powerprofilesctl`），动态识别并切换本机可用电源档位（`省电` / `平衡` / `性能`）；
+  - 支持 **「模型休眠自动切省电」** 联动：Router 模式下所有模型休眠时自动切 `power-saver`，加载唤醒时自动切回 `balanced`；
+  - 支持安全 **「整机休眠（S3）」**：执行 `systemctl suspend` 前自动先卸载已加载模型释放显存，配合 Wake-on-LAN 实现一键唤醒；非 Linux 环境自动隐藏该卡片。
 - **模型信息与一键测速**：
   - 展示模型 ID、上下文窗口 `n_ctx`、量化格式 `ftype`、参数量与文件大小；
   - 模型卡内置 **「快速测速」** 按钮（`POST /api/probe`），发送极短对话探针并返回总耗时、Prefill、Decode 速度与 MTP 投机解码接受率。
@@ -55,6 +60,7 @@ python main.py
 | `--server-cmd` | `llama-server` | 面板直接拉起 `llama-server` 的命令（空格分隔） |
 | `--log` | `llama-server.log` | `llama-server` 日志文件路径（支持直接读取外部/systemd 日志） |
 | `--systemd-unit` | 无 | 指定 `systemd` 单元名（如 `llama-server`），启停与重启走 `systemctl` |
+| `--models-preset` | 无 | 指定 Router 模式的 `models.ini` 路径，开启面板在线修改空闲休眠时长 |
 
 ### 启动示例
 
@@ -136,15 +142,20 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now llama-panel.service
 ```
 
-### 3. 最小权限 Polkit 规则（允许非 root 用户在网页一键启停）
+### 3. 最小权限 Polkit 规则（允许非 root 用户在网页一键启停、切电源与 S3 休眠）
 
-`/etc/polkit-1/rules.d/50-llama-panel.rules`（仅放行指定用户管理 `llama-server.service` 单个单元）：
+`/etc/polkit-1/rules.d/50-llama-panel.rules`（按需放行指定用户的最小权限）：
 
 ```javascript
 polkit.addRule(function(action, subject) {
+    if (subject.user !== "<user>") return;
     if (action.id === "org.freedesktop.systemd1.manage-units" &&
-        (action.lookup("unit") === "llama-server.service" || action.lookup("unit") === "llama-server") &&
-        subject.user === "<user>") {
+        (action.lookup("unit") === "llama-server.service" || action.lookup("unit") === "llama-server")) {
+        return polkit.Result.YES;
+    }
+    if (action.id === "org.freedesktop.UPower.PowerProfiles.switch-profile" ||
+        action.id === "org.freedesktop.login1.suspend" ||
+        action.id === "org.freedesktop.login1.suspend-multiple-sessions") {
         return polkit.Result.YES;
     }
 });
@@ -155,27 +166,33 @@ polkit.addRule(function(action, subject) {
 | 方法 | 路径 | 说明 |
 |---|---|---|
 | GET | `/` | 面板单页前端 |
-| GET | `/api/status` | 聚合状态：`health` / `models` / `model_state` / `process` / `slots` / `metrics` / `gpu`（Router `unloaded` 或卸载冷却期内不请求上游 `/slots` 与 `/metrics`） |
+| GET | `/api/status` | 聚合状态：`health` / `models` / `models_list` / `model_state` / `preset_editable` / `process` / `slots` / `metrics` / `gpu` / `power` |
 | GET | `/api/logs?n=200` | 返回日志文件末尾 `n` 行 |
-| POST | `/api/model/load` | Router 模式手动加载模型（body 可选 `{"model": "..."}`，缺省取当前模型；无模型 400，上游失败 502） |
+| POST | `/api/model/load` | Router 模式手动加载/切换模型（body 可选 `{"model": "..."}`；无模型 400，上游失败 502） |
 | POST | `/api/model/unload` | Router 模式手动卸载模型并启动 5 秒防误唤醒冷却期（参数与状态码同上） |
+| POST | `/api/preset/sleep-idle` | 在线修改 `models.ini` 的 `sleep-idle-seconds`（`{"seconds": 600, "restart": true}`） |
+| POST | `/api/power/profile` | 切换 CPU 电源档位（`{"profile": "power-saver"\|"balanced"\|"performance"}`） |
+| POST | `/api/power/auto` | 开关「模型休眠自动切省电」联动（`{"enabled": true\|false}`） |
+| POST | `/api/power/suspend` | 安全整机 S3 休眠（先卸载已加载模型释放显存，再延迟触发 `systemctl suspend`） |
 | POST | `/api/server/start` | 启动 `llama-server`（运行中 409；`systemd` 模式走 `systemctl start`） |
 | POST | `/api/server/stop` | 停止 `llama-server`（外部进程按端口发现 PID 终止；`systemd` 模式走 `systemctl stop`） |
 | POST | `/api/server/restart` | 重启 `llama-server`（面板模式先停后启；`systemd` 模式走 `systemctl restart`） |
-| POST | `/api/probe` | 一键快速测速探针，返回耗时、Prefill/Decode 速度与 MTP 接受率（失败 502） |
+| POST | `/api/probe` | 一键快速测速探针（支持可选 `{"model": "..."}`），返回耗时、Prefill/Decode 与 MTP 接受率 |
 
 ## 项目结构
 
 ```text
 main.py              # CLI 入口与参数解析
 llama_panel/
-  app.py             # Flask 应用、API 路由、systemd 托管与卸载并发防护（锁 + 冷却期）
-  client.py          # llama-server HTTP 客户端、Prometheus 解析、快速测速与 Router 控制
+  app.py             # Flask 应用、API 路由、systemd 托管、省电联动与卸载并发防护
+  client.py          # llama-server HTTP 客户端、Prometheus 解析、多模型 Router 控制与测速
   gpu.py             # GPU/VRAM 只读采集（rocm-smi / nvidia-smi）与纯函数解析
+  power.py           # 整机电源档位（powerprofilesctl）与 S3 休眠封装
+  preset.py          # models.ini 空闲休眠时长安全改写纯函数
   process.py         # 子进程管理与跨平台外部进程发现/终止
-static/index.html    # 零依赖深色单页面板（SVG 趋势图、日志查看器、页面内确认弹窗）
-fake_llama.py        # 模拟 llama-server（支持 --router 模式、误唤醒计数与 stale_loaded 钩子）
-test_e2e.py          # 单元测试与端到端测试（GPU/uptime/Router 解析、启停重启、探针、8 线程并发防误唤醒）
+static/index.html    # 零依赖深色单页面板（多模型列表、电源卡、SVG 趋势图、日志查看器）
+fake_llama.py        # 模拟 llama-server（支持单/多模型 --router 模式与并发误唤醒测试钩子）
+test_e2e.py          # 单元测试与端到端测试（GPU/uptime/Router/INI/电源解析、多模型切换与并发防护）
 ```
 
 ## 运行测试

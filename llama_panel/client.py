@@ -67,8 +67,63 @@ def _sleep_idle_seconds(status: dict) -> int | None:
     return None
 
 
+def _item_state(item: dict) -> str:
+    """单项模型状态：Router 取 status["value"]，非 Router 有 id 即 loaded。"""
+    status = item.get("status")
+    if isinstance(status, dict) and "value" in status:
+        value = status.get("value")
+        return value if isinstance(value, str) and value else "unknown"
+    return "loaded" if item.get("id") else "none"
+
+
+def parse_models_list(models_payload: dict | None) -> list[dict]:
+    """将 GET /v1/models 的 data 列表解析为每项摘要。
+
+    每项: {"id": str, "state": str, "sleep_idle_seconds": int | None,
+           "meta": dict, "modalities": list[str]}
+
+    - modalities 取 meta.architecture.input_modalities，默认 ["text"]
+    - 非 Router 单模型模式 state 为 "loaded"
+    """
+    data = models_payload.get("data") if isinstance(models_payload, dict) else None
+    out: list[dict] = []
+    if not isinstance(data, list):
+        return out
+    for item in data:
+        if not isinstance(item, dict):
+            continue
+        status = item.get("status")
+        router = isinstance(status, dict) and "value" in status
+        meta = item.get("meta") if isinstance(item.get("meta"), dict) else {}
+        modalities = ["text"]
+        arch = item.get("architecture") if isinstance(item.get("architecture"), dict) else meta.get("architecture")
+        if isinstance(arch, dict):
+            im = arch.get("input_modalities")
+            if isinstance(im, list) and im:
+                modalities = [str(x) for x in im]
+        if router and "image" not in modalities and isinstance(status, dict):
+            args = status.get("args")
+            preset = status.get("preset")
+            has_mmproj = (
+                (isinstance(args, list) and "--mmproj" in args)
+                or (isinstance(preset, str) and re.search(r"^\s*mmproj\s*=", preset, re.MULTILINE) is not None)
+            )
+            if has_mmproj:
+                modalities.append("image")
+        out.append(
+            {
+                "id": item.get("id"),
+                "state": _item_state(item),
+                "sleep_idle_seconds": _sleep_idle_seconds(status) if router else None,
+                "meta": meta,
+                "modalities": modalities,
+            }
+        )
+    return out
+
+
 def parse_model_state(models_payload: dict | None) -> dict:
-    """从 GET /v1/models 响应解析模型状态（Router 模式感知）。
+    """从 GET /v1/models 响应解析模型状态（Router 多模型感知）。
 
     返回 {"router_mode": bool, "model_id": str | None,
           "state": str, "sleep_idle_seconds": int | None}
@@ -77,16 +132,28 @@ def parse_model_state(models_payload: dict | None) -> dict:
     - state: Router 模式取 status["value"]（loaded/unloaded/loading）；
       非 Router 单模型模式有 model_id 则为 "loaded"，否则 "none"
     - sleep_idle_seconds: 仅 Router 模式从 status 解析，未配置为 None
+    - 多模型 Router：优先选第一个 loaded，其次第一个 loading，最后兜底
+      data[0]——确保切换到第 2/3 个预设后 /slots 与 /metrics 指向
+      当前已加载的模型
     """
     data = models_payload.get("data") if isinstance(models_payload, dict) else None
-    first = data[0] if isinstance(data, list) and data and isinstance(data[0], dict) else {}
-    model_id = first.get("id")
+    items = [d for d in data if isinstance(d, dict)] if isinstance(data, list) else []
+    first = items[0] if items else {}
     status = first.get("status")
     router_mode = isinstance(status, dict) and "value" in status
     if router_mode:
-        value = status.get("value")
-        state = value if isinstance(value, str) and value else "unknown"
-        sleep_idle = _sleep_idle_seconds(status)
+        for want in ("loaded", "loading"):
+            for it in items:
+                if _item_state(it) == want:
+                    first = it
+                    break
+            if _item_state(first) == want:
+                break
+    model_id = first.get("id")
+    status = first.get("status")
+    if router_mode:
+        state = _item_state(first)
+        sleep_idle = _sleep_idle_seconds(status) if isinstance(status, dict) else None
     else:
         state = "loaded" if model_id else "none"
         sleep_idle = None
