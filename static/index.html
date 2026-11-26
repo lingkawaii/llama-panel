@@ -80,8 +80,30 @@
     border-color: rgba(247, 92, 92, 0.65); background: rgba(247, 92, 92, 0.12);
     box-shadow: 0 0 0 3px rgba(247, 92, 92, 0.1);
   }
-  button.power-btn.active {
-    background: var(--accent-soft); border-color: rgba(91, 140, 255, 0.55); color: #c7d7ff;
+  .power-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
+  .power-info { display: flex; align-items: center; gap: 10px; min-width: 0; }
+  .power-icon {
+    width: 32px; height: 32px; border-radius: 9px; flex-shrink: 0;
+    display: inline-flex; align-items: center; justify-content: center;
+    background: rgba(91, 140, 255, 0.14); border: 1px solid rgba(91, 140, 255, 0.3);
+  }
+  .power-icon svg { width: 16px; height: 16px; }
+  .power-title { font-size: 13px; font-weight: 600; white-space: nowrap; }
+  .power-desc { font-size: 12px; color: var(--muted); margin-top: 2px; }
+  .seg {
+    display: inline-flex; gap: 4px; padding: 4px; flex-shrink: 0;
+    background: rgba(0, 0, 0, 0.35); border: 1px solid var(--border); border-radius: 12px;
+    box-shadow: inset 0 2px 6px rgba(0, 0, 0, 0.45);
+  }
+  .power-btn {
+    border: 1px solid transparent; background: transparent; border-radius: 9px;
+    padding: 5px 14px; color: var(--muted);
+  }
+  .power-btn:hover { background: rgba(255, 255, 255, 0.06); color: var(--fg); }
+  .power-btn.active {
+    background: linear-gradient(135deg, rgba(91, 140, 255, 0.5), rgba(91, 140, 255, 0.18));
+    border-color: rgba(91, 140, 255, 0.65); color: #dbe6ff;
+    box-shadow: 0 0 10px rgba(91, 140, 255, 0.35), inset 0 0 0 1px rgba(91, 140, 255, 0.25);
   }
   .table-wrap { overflow-x: auto; }
   table { width: 100%; border-collapse: collapse; font-size: 13px; }
@@ -183,23 +205,6 @@
     margin-top: 12px; padding-top: 10px; border-top: 1px solid var(--border);
     display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
   }
-  .switch { position: relative; display: inline-block; width: 36px; height: 20px; flex-shrink: 0; }
-  .switch input { opacity: 0; width: 0; height: 0; position: absolute; }
-  .switch .slider {
-    position: absolute; inset: 0; cursor: pointer;
-    background: rgba(255, 255, 255, 0.12); border: 1px solid var(--border);
-    border-radius: 999px; transition: background .18s ease, border-color .18s ease;
-  }
-  .switch .slider::before {
-    content: ""; position: absolute; width: 14px; height: 14px; left: 2px; top: 2px;
-    border-radius: 50%; background: #cdd3df;
-    transition: transform .18s ease, background .18s ease;
-  }
-  .switch input:checked + .slider {
-    background: var(--accent-soft); border-color: rgba(91, 140, 255, 0.55);
-  }
-  .switch input:checked + .slider::before { transform: translateX(16px); background: var(--accent); }
-  .switch input:focus-visible + .slider { outline: 2px solid var(--accent); outline-offset: 2px; }
   .legend-dot {
     display: inline-block; width: 8px; height: 8px; border-radius: 50%;
     margin-right: 5px; vertical-align: baseline;
@@ -300,7 +305,7 @@
   </section>
 
   <section id="power-section" class="hidden">
-    <h2>电源与省电</h2>
+    <h2>电源模式</h2>
     <div class="card" id="power-card"><span class="muted">加载中…</span></div>
   </section>
 
@@ -626,7 +631,7 @@ function modelRowHtml(m) {
   </div>`;
 }
 
-// ---- 电源与省电 ----
+// ---- 电源模式 ----
 function renderPower(p) {
   const section = $("power-section");
   const el = $("power-card");
@@ -635,22 +640,22 @@ function renderPower(p) {
   const cur = p.current;
   const avail = p.available || [];
   const nameMap = { "power-saver": "省电", "balanced": "平衡", "performance": "性能" };
+  const descMap = { "power-saver": "低功耗静音", "balanced": "兼顾性能与功耗", "performance": "满载性能优先" };
   const btns = avail.length
     ? avail.map((name) =>
         `<button class="power-btn ${name === cur ? "active" : ""}" data-profile="${name}">${nameMap[name] || name}</button>`
       ).join("")
     : `<span class="muted">（无可用档位）</span>`;
-  const suspendBtn = p.can_suspend
-    ? `<button id="btn-suspend" class="danger">整机休眠</button>` : "";
   el.innerHTML = `
-    <div class="row">
-      <span class="label">电源档位</span>
-      ${btns}
-      <span style="flex:1"></span>
-      ${suspendBtn}
-    </div>
-    <div class="row" style="margin-top:10px">
-      <label class="switch-wrap" style="display:inline-flex;align-items:center;gap:10px;cursor:pointer"><span class="switch"><input type="checkbox" id="chk-auto-power" ${p.auto_power_saver ? "checked" : ""}><span class="slider"></span></span><span>模型休眠自动切省电</span></label>
+    <div class="power-row">
+      <div class="power-info">
+        <span class="power-icon"><svg viewBox="0 0 24 24" fill="none" stroke="#9db4ff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M13 2 3 14h9l-1 8 10-12h-9l1-8z"/></svg></span>
+        <div>
+          <div class="power-title">当前档位：${nameMap[cur] || cur || "未知"}</div>
+          <div class="power-desc">${descMap[cur] || ""}</div>
+        </div>
+      </div>
+      <div class="seg">${btns}</div>
     </div>
     <div id="power-err"></div>`;
 }
@@ -669,39 +674,6 @@ async function setPowerProfile(profile) {
     if (errEl) errEl.innerHTML = `<div class="err-bar">${escHtml(`请求失败: ${e}`)}</div>`;
   }
   fetchStatus();
-}
-
-async function toggleAutoPower(enabled) {
-  const errEl = $("power-err");
-  if (errEl) errEl.innerHTML = "";
-  try {
-    const r = await fetch("/api/power/auto", {
-      method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ enabled }),
-    });
-    const d = await r.json();
-    if (!d.ok) errEl.innerHTML = `<div class="err-bar">${escHtml(d.error || `请求失败（HTTP ${r.status}）`)}</div>`;
-  } catch (e) {
-    if (errEl) errEl.innerHTML = `<div class="err-bar">${escHtml(`请求失败: ${e}`)}</div>`;
-  }
-  fetchStatus();
-}
-
-async function doSuspend() {
-  if (!(await askConfirm("确认让主机进入 S3 深度休眠？休眠前会自动卸载模型，之后需通过 Wake-on-LAN 或电源键唤醒。"))) return;
-  const errEl = $("power-err");
-  if (errEl) errEl.innerHTML = "";
-  const btn = $("btn-suspend");
-  if (btn) { btn.disabled = true; btn.textContent = "休眠中…"; }
-  try {
-    const r = await fetch("/api/power/suspend", { method: "POST" });
-    const d = await r.json();
-    if (!d.ok) errEl.innerHTML = `<div class="err-bar">${escHtml(d.error || `请求失败（HTTP ${r.status}）`)}</div>`;
-  } catch (e) {
-    if (errEl) errEl.innerHTML = `<div class="err-bar">${escHtml(`请求失败: ${e}`)}</div>`;
-  }
-  const b = $("btn-suspend");
-  if (b) { b.disabled = false; b.textContent = "整机休眠"; }
 }
 
 async function applySleepIdle() {
@@ -827,7 +799,7 @@ function renderStatus(data) {
   // 显卡 / VRAM
   renderGpu(data.gpu);
 
-  // 电源与省电（非 Linux 或无工具时 power 为 null，整卡隐藏）
+  // 电源模式（非 Linux 或无工具时 power 为 null，整卡隐藏）
   renderPower(data.power);
 
   // 指标卡：固定 4×2 布局
@@ -1113,10 +1085,6 @@ $("model-card").addEventListener("change", (e) => {
 });
 $("power-card").addEventListener("click", (e) => {
   if (e.target.classList.contains("power-btn") && !e.target.disabled) setPowerProfile(e.target.dataset.profile);
-  if (e.target.id === "btn-suspend" && !e.target.disabled) doSuspend();
-});
-$("power-card").addEventListener("change", (e) => {
-  if (e.target.id === "chk-auto-power") toggleAutoPower(e.target.checked);
 });
 
 $("btn-refresh").onclick = () => { fetchStatus(); fetchLogs(); };
