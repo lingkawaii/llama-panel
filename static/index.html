@@ -6,65 +6,185 @@
 <title>llama.cpp 控制面板</title>
 <style>
   :root {
-    --bg: #0d1117; --card: #161b22; --border: #30363d;
-    --fg: #e6edf3; --muted: #8b949e; --accent: #58a6ff;
-    --ok: #3fb950; --warn: #d29922; --err: #f85149;
+    --bg: #090b10;
+    --card: rgba(18, 22, 31, 0.82);
+    --border: rgba(255, 255, 255, 0.08);
+    --border-strong: rgba(255, 255, 255, 0.14);
+    --fg: #e8ecf3; --muted: #8b93a7;
+    --accent: #5b8cff; --accent-soft: rgba(91, 140, 255, 0.16);
+    --ok: #34d399; --warn: #f5b942; --err: #f75c5c;
+    --radius: 14px;
   }
   * { box-sizing: border-box; }
-  body { margin: 0; background: var(--bg); color: var(--fg);
-         font: 14px/1.5 system-ui, "Segoe UI", sans-serif; }
+  html { color-scheme: dark; }
+  body { margin: 0; color: var(--fg);
+         font: 14px/1.55 system-ui, "Segoe UI", "Microsoft YaHei", sans-serif;
+         background:
+           radial-gradient(900px 480px at 18% -12%, rgba(99, 102, 241, 0.14), transparent 60%),
+           radial-gradient(760px 420px at 82% -10%, rgba(34, 211, 238, 0.10), transparent 60%),
+           var(--bg);
+         background-attachment: fixed; min-height: 100vh; }
   .wrap { max-width: 1200px; margin: 0 auto; padding: 16px; }
-  h1 { font-size: 18px; margin: 8px 0 16px; }
-  h2 { font-size: 14px; color: var(--muted); margin: 0 0 8px; text-transform: uppercase; letter-spacing: .05em; }
+  h1 { font-size: 18px; margin: 8px 0 16px; font-weight: 600; }
+  h2 { font-size: 12px; color: var(--muted); margin: 0 0 8px; text-transform: uppercase; letter-spacing: .08em; font-weight: 600; }
   .grid { display: grid; gap: 12px; }
   .metrics-grid { display: grid; gap: 12px; grid-template-columns: repeat(4, minmax(0, 1fr)); }
   @media (max-width: 768px) {
     .metrics-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   }
-  .card { background: var(--card); border: 1px solid var(--border); border-radius: 8px; padding: 12px; }
+  .card {
+    background: var(--card);
+    backdrop-filter: blur(12px); -webkit-backdrop-filter: blur(12px);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 14px;
+    box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.04), 0 6px 18px rgba(0, 0, 0, 0.28);
+    transition: border-color .18s ease, background .18s ease, box-shadow .18s ease;
+  }
+  .card:hover {
+    border-color: var(--border-strong);
+    background: rgba(22, 27, 38, 0.85);
+    box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.06), 0 10px 26px rgba(0, 0, 0, 0.34);
+  }
   .card .label { color: var(--muted); font-size: 12px; }
   .card .value { font-size: 22px; font-weight: 600; font-variant-numeric: tabular-nums; margin-top: 4px; }
   .card .value .unit { font-size: 12px; font-weight: 400; color: var(--muted); margin-left: 6px; }
   .card .sub { color: var(--muted); font-size: 12px; margin-top: 2px; }
   .row { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
   .actions { display: flex; gap: 8px; flex-shrink: 0; }
-  .dot { width: 10px; height: 10px; border-radius: 50%; background: var(--err); display: inline-block; }
-  .dot.on { background: var(--ok); }
-  button { background: var(--card); color: var(--fg); border: 1px solid var(--border);
-           border-radius: 6px; padding: 6px 14px; cursor: pointer; font-size: 13px; }
-  button:hover { border-color: var(--accent); }
-  button:disabled { opacity: .5; cursor: default; }
-  button.danger:hover { border-color: var(--err); }
-  button.power-btn.active { border-color: var(--accent); color: var(--accent); }
+  .dot { width: 10px; height: 10px; border-radius: 50%; background: var(--err); display: inline-block; flex-shrink: 0; }
+  .dot.on { background: var(--ok); animation: dot-breathe 2.2s ease-in-out infinite; }
+  @keyframes dot-breathe {
+    0%, 100% { box-shadow: 0 0 0 0 rgba(52, 211, 153, 0.45); }
+    50% { box-shadow: 0 0 0 6px rgba(52, 211, 153, 0); }
+  }
+  button {
+    background: rgba(255, 255, 255, 0.04); color: var(--fg);
+    border: 1px solid var(--border); border-radius: 8px;
+    padding: 6px 14px; cursor: pointer; font-size: 13px;
+    transition: background .15s ease, border-color .15s ease, box-shadow .15s ease;
+  }
+  button:hover { background: rgba(255, 255, 255, 0.08); border-color: var(--border-strong); }
+  button:disabled { opacity: .45; cursor: default; }
+  button:disabled:hover { background: rgba(255, 255, 255, 0.04); border-color: var(--border); }
+  button.btn-primary, #btn-start, #btn-apply-sleep-idle, #confirm-ok, .mm-load {
+    background: var(--accent-soft); border-color: rgba(91, 140, 255, 0.45); color: #c7d7ff;
+  }
+  button.btn-primary:hover, #btn-start:hover, #btn-apply-sleep-idle:hover,
+  #confirm-ok:hover, .mm-load:hover {
+    background: rgba(91, 140, 255, 0.26); border-color: rgba(91, 140, 255, 0.7);
+    box-shadow: 0 0 0 3px rgba(91, 140, 255, 0.12);
+  }
+  button.danger { color: #f3b8b8; }
+  button.danger:hover {
+    border-color: rgba(247, 92, 92, 0.65); background: rgba(247, 92, 92, 0.12);
+    box-shadow: 0 0 0 3px rgba(247, 92, 92, 0.1);
+  }
+  button.power-btn.active {
+    background: var(--accent-soft); border-color: rgba(91, 140, 255, 0.55); color: #c7d7ff;
+  }
   .table-wrap { overflow-x: auto; }
   table { width: 100%; border-collapse: collapse; font-size: 13px; }
-  th, td { text-align: left; padding: 6px 10px; border-bottom: 1px solid var(--border);
+  th, td { text-align: left; padding: 6px 10px; border-bottom: 1px solid rgba(255, 255, 255, 0.06);
           font-variant-numeric: tabular-nums; }
   th { color: var(--muted); font-weight: 500; }
-  code { background: #21262d; padding: 1px 5px; border-radius: 4px; font-size: 12px; }
-  #logs { background: #010409; border: 1px solid var(--border); border-radius: 8px;
-          padding: 10px; font: 12px/1.6 ui-monospace, Consolas, monospace;
-          height: 240px; overflow-y: auto; white-space: pre-wrap; word-break: break-all; }
+  code { background: rgba(255, 255, 255, 0.07); padding: 1px 5px; border-radius: 4px; font-size: 12px; }
+  #logs {
+    background: rgba(2, 4, 8, 0.75); border: 1px solid var(--border); border-radius: 10px;
+    padding: 10px; font: 12px/1.6 ui-monospace, Consolas, monospace;
+    height: 240px; overflow-y: auto; white-space: pre-wrap; word-break: break-all;
+  }
+  #logs::-webkit-scrollbar, .table-wrap::-webkit-scrollbar { width: 8px; height: 8px; }
+  #logs::-webkit-scrollbar-thumb, .table-wrap::-webkit-scrollbar-thumb {
+    background: rgba(255, 255, 255, 0.14); border-radius: 4px; }
+  #logs::-webkit-scrollbar-thumb:hover { background: rgba(255, 255, 255, 0.22); }
+  #logs::-webkit-scrollbar-track { background: transparent; }
   .tag { display: inline-block; padding: 1px 8px; border-radius: 10px; font-size: 12px; }
-  .tag.busy { background: rgba(63,185,80,.15); color: var(--ok); }
-  .tag.idle { background: rgba(160,160,170,.15); color: var(--muted); }
-  .tag.loaded { background: rgba(63,185,80,.15); color: var(--ok); }
-  .tag.sleeping { background: rgba(210,153,34,.15); color: var(--warn); }
-  .tag.loading { background: rgba(88,166,255,.15); color: var(--accent); }
+  .tag.busy { background: rgba(52, 211, 153, .15); color: var(--ok); }
+  .tag.idle { background: rgba(160, 160, 170, .15); color: var(--muted); }
+  .tag.loaded { background: rgba(52, 211, 153, .15); color: var(--ok); }
+  .tag.sleeping { background: rgba(245, 185, 66, .15); color: var(--warn); }
+  .tag.loading { background: rgba(91, 140, 255, .15); color: var(--accent); }
   section { margin-bottom: 20px; }
   .muted { color: var(--muted); }
-  .bar { height: 8px; background: #21262d; border-radius: 4px; margin-top: 8px; overflow: hidden; }
-  .bar-fill { height: 100%; transition: width .3s; }
-  .bar-fill.accent { background: var(--accent); }
-  .bar-fill.warn { background: var(--warn); }
-  .bar-fill.err { background: var(--err); }
-  .err-bar { margin-top: 8px; padding: 6px 10px; border: 1px solid var(--err);
-            border-radius: 6px; color: var(--err); font-size: 12px; }
+  .bar { height: 8px; background: rgba(255, 255, 255, 0.07); border-radius: 4px; margin-top: 8px; overflow: hidden; }
+  .bar-fill { height: 100%; transition: width .3s; border-radius: 4px; }
+  .bar-fill.accent { background: linear-gradient(90deg, #4f7cff, #7aa2ff); box-shadow: 0 0 8px rgba(91, 140, 255, 0.5); }
+  .bar-fill.warn { background: linear-gradient(90deg, #e0a83a, #f5c76e); box-shadow: 0 0 8px rgba(245, 185, 66, 0.4); }
+  .bar-fill.err { background: linear-gradient(90deg, #e04f4f, #f58a8a); box-shadow: 0 0 8px rgba(247, 92, 92, 0.4); }
+  .err-bar { margin-top: 8px; padding: 6px 10px; border: 1px solid rgba(247, 92, 92, 0.5);
+            background: rgba(247, 92, 92, 0.08); border-radius: 8px; color: #f5a3a3; font-size: 12px; }
   details summary { cursor: pointer; color: var(--muted); font-size: 13px; margin-bottom: 8px; }
   details summary:hover { color: var(--fg); }
-  .header { display: flex; align-items: center; justify-content: space-between;
-            gap: 12px; flex-wrap: wrap; }
-  .header h1 { margin: 8px 0; }
+  .header {
+    position: sticky; top: 0; z-index: 20;
+    display: flex; align-items: center; justify-content: space-between;
+    gap: 12px; flex-wrap: wrap;
+    padding: 10px 14px; margin: 0 -4px 16px;
+    background: rgba(13, 16, 23, 0.72);
+    backdrop-filter: blur(12px); -webkit-backdrop-filter: blur(12px);
+    border: 1px solid var(--border); border-radius: var(--radius);
+    box-shadow: 0 8px 24px rgba(0, 0, 0, 0.35);
+  }
+  .header h1 { margin: 0; display: flex; align-items: center; gap: 10px; }
+  .header .logo { width: 22px; height: 22px; flex-shrink: 0; }
+  .bento-top {
+    display: grid; grid-template-columns: 1.05fr 1fr; gap: 16px; align-items: stretch;
+    margin-bottom: 20px;
+  }
+  .bento-top > section { display: flex; flex-direction: column; margin-bottom: 0; }
+  .bento-top .card { flex: 1; height: auto; }
+  @media (max-width: 900px) {
+    .bento-top { grid-template-columns: 1fr; }
+  }
+  .gpu-stats { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; margin-top: 10px; }
+  @media (max-width: 640px) {
+    .gpu-stats { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  }
+  .gpu-stat {
+    background: rgba(9, 11, 16, 0.55); border: 1px solid var(--border);
+    border-radius: 10px; padding: 8px 10px;
+  }
+  .gpu-stat .label { color: var(--muted); font-size: 11px; }
+  .gpu-stat .value { font-size: 15px; font-weight: 600; font-variant-numeric: tabular-nums; margin-top: 2px; }
+  .gpu-stat .value .unit { font-size: 11px; color: var(--muted); margin-left: 4px; font-weight: 400; }
+  .model-row {
+    background: rgba(9, 11, 16, 0.5); border: 1px solid var(--border);
+    border-radius: 10px; padding: 10px 12px;
+    display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+    transition: border-color .15s ease, background .15s ease;
+  }
+  .model-row + .model-row { margin-top: 8px; }
+  .model-row:hover { border-color: var(--border-strong); background: rgba(13, 17, 25, 0.65); }
+  .model-row.is-loaded {
+    border-left: 3px solid var(--ok);
+    background: rgba(52, 211, 153, 0.06);
+  }
+  .sleep-bar {
+    margin-top: 12px; padding-top: 10px; border-top: 1px solid var(--border);
+    display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+  }
+  .switch { position: relative; display: inline-block; width: 36px; height: 20px; flex-shrink: 0; }
+  .switch input { opacity: 0; width: 0; height: 0; position: absolute; }
+  .switch .slider {
+    position: absolute; inset: 0; cursor: pointer;
+    background: rgba(255, 255, 255, 0.12); border: 1px solid var(--border);
+    border-radius: 999px; transition: background .18s ease, border-color .18s ease;
+  }
+  .switch .slider::before {
+    content: ""; position: absolute; width: 14px; height: 14px; left: 2px; top: 2px;
+    border-radius: 50%; background: #cdd3df;
+    transition: transform .18s ease, background .18s ease;
+  }
+  .switch input:checked + .slider {
+    background: var(--accent-soft); border-color: rgba(91, 140, 255, 0.55);
+  }
+  .switch input:checked + .slider::before { transform: translateX(16px); background: var(--accent); }
+  .switch input:focus-visible + .slider { outline: 2px solid var(--accent); outline-offset: 2px; }
+  .legend-dot {
+    display: inline-block; width: 8px; height: 8px; border-radius: 50%;
+    margin-right: 5px; vertical-align: baseline;
+  }
   .trend-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr));
                gap: 12px; margin-top: 12px; }
   .trend-grid.single { grid-template-columns: 1fr; }
@@ -76,17 +196,31 @@
   .trend-legend span { margin-right: 12px; }
   .trend-legend b { color: var(--fg); font-weight: 500; }
   #slot-table th, #slot-table td { white-space: nowrap; }
+  select, input[type="search"] {
+    background: rgba(9, 11, 16, 0.6); color: var(--fg);
+    border: 1px solid var(--border); border-radius: 8px;
+    padding: 5px 10px; font-size: 12px;
+    transition: border-color .15s ease, background .15s ease;
+  }
+  select:hover, input[type="search"]:hover { border-color: var(--border-strong); }
+  select:focus, input[type="search"]:focus {
+    outline: none; border-color: rgba(91, 140, 255, 0.6);
+    box-shadow: 0 0 0 3px rgba(91, 140, 255, 0.12);
+  }
+  select option { background: #12161f; color: var(--fg); }
   .log-toolbar { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-bottom: 8px; }
-  .log-toolbar input[type="search"] { background: #010409; color: var(--fg);
-        border: 1px solid var(--border); border-radius: 6px; padding: 5px 8px;
-        font-size: 12px; width: 160px; }
-  .log-toolbar select { background: var(--card); color: var(--fg);
-        border: 1px solid var(--border); border-radius: 6px; padding: 4px 6px; font-size: 12px; }
+  .log-toolbar input[type="search"] { width: 160px; }
   .log-f { padding: 4px 10px; font-size: 12px; }
-  .log-f.active { border-color: var(--accent); color: var(--accent); }
+  .log-f.active {
+    background: var(--accent-soft); border-color: rgba(91, 140, 255, 0.55); color: #c7d7ff;
+  }
   .hidden { display: none !important; }
-  #confirm-modal { position: fixed; inset: 0; background: rgba(0,0,0,.6);
-                   display: flex; align-items: center; justify-content: center; z-index: 100; }
+  #confirm-modal {
+    position: fixed; inset: 0;
+    background: rgba(5, 7, 12, 0.55);
+    backdrop-filter: blur(6px); -webkit-backdrop-filter: blur(6px);
+    display: flex; align-items: center; justify-content: center; z-index: 100;
+  }
   #confirm-modal .card { width: min(420px, calc(100vw - 32px)); }
   #confirm-msg { margin-bottom: 12px; }
   #confirm-actions { justify-content: flex-end; }
@@ -96,6 +230,16 @@
 <div class="wrap">
   <div class="header">
     <h1>
+      <svg class="logo" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+        <defs>
+          <linearGradient id="logo-grad" x1="0" y1="0" x2="24" y2="24" gradientUnits="userSpaceOnUse">
+            <stop stop-color="#7aa2ff"/><stop offset="1" stop-color="#22d3ee"/>
+          </linearGradient>
+        </defs>
+        <rect x="5" y="5" width="14" height="14" rx="3" stroke="url(#logo-grad)" stroke-width="1.5"/>
+        <rect x="9.5" y="9.5" width="5" height="5" rx="1.2" fill="url(#logo-grad)"/>
+        <path d="M9 2v3M15 2v3M9 19v3M15 19v3M2 9h3M2 15h3M19 9h3M19 15h3" stroke="url(#logo-grad)" stroke-width="1.5" stroke-linecap="round"/>
+      </svg>
       <span class="dot" id="dot"></span>
       llama.cpp 控制面板
     </h1>
@@ -105,32 +249,34 @@
     </div>
   </div>
 
-  <section>
-    <h2>服务</h2>
-    <div class="card">
-      <div class="row">
-        <span class="dot" id="proc-dot"></span>
-        <span id="proc-state" class="muted">…</span>
-        <span style="flex:1"></span>
-        <span class="actions">
-          <button id="btn-start">启动</button>
-          <button id="btn-stop" class="danger">停止</button>
-          <button id="btn-restart">重启</button>
-        </span>
+  <div class="bento-top">
+    <section>
+      <h2>服务</h2>
+      <div class="card">
+        <div class="row">
+          <span class="dot" id="proc-dot"></span>
+          <span id="proc-state" class="muted">…</span>
+          <span style="flex:1"></span>
+          <span class="actions">
+            <button id="btn-start">启动</button>
+            <button id="btn-stop" class="danger">停止</button>
+            <button id="btn-restart">重启</button>
+          </span>
+        </div>
+        <div class="sub" id="proc-cmd"></div>
+        <div class="err-bar" id="proc-err" hidden></div>
       </div>
-      <div class="sub" id="proc-cmd"></div>
-      <div class="err-bar" id="proc-err" hidden></div>
-    </div>
-  </section>
+    </section>
+
+    <section>
+      <h2>显卡 / VRAM</h2>
+      <div class="card" id="gpu-card"><span class="muted">加载中…</span></div>
+    </section>
+  </div>
 
   <section>
     <h2>模型</h2>
     <div class="card" id="model-card"><span class="muted">加载中…</span></div>
-  </section>
-
-  <section>
-    <h2>显卡 / VRAM</h2>
-    <div class="card" id="gpu-card"><span class="muted">加载中…</span></div>
   </section>
 
   <section id="power-section" class="hidden">
@@ -374,7 +520,7 @@ function trendLegend(series) {
     const vals = s.data.filter((v) => v !== null);
     const last = vals.length ? vals[vals.length - 1] : null;
     const peak = vals.length ? Math.max(...vals) : null;
-    return `<span>${s.name} <b>${last === null ? "—" : s.fmt(last)}</b> · 峰值 ${peak === null ? "—" : s.fmt(peak)}</span>`;
+    return `<span><i class="legend-dot" style="background:${s.color}"></i>${s.name} <b>${last === null ? "—" : s.fmt(last)}</b> · 峰值 ${peak === null ? "—" : s.fmt(peak)}</span>`;
   }).join("");
 }
 
@@ -408,17 +554,18 @@ function renderGpu(g) {
   const cls = pct === null ? "accent" : pct > 95 ? "err" : pct > 85 ? "warn" : "accent";
   const bar = pct === null ? "" :
     `<div class="bar"><div class="bar-fill ${cls}" style="width:${Math.min(100, pct)}%"></div></div>`;
-  const sub = [
-    `VRAM ${fmtBytes(g.vram_used_bytes)} / ${fmtBytes(g.vram_total_bytes)}` +
-      (pct !== null ? `（${pct.toFixed(1)}%）` : ""),
-    `利用率 ${g.gpu_util_percent !== null ? g.gpu_util_percent.toFixed(0) + "%" : "—"}`,
-    `温度 ${g.temp_c !== null ? g.temp_c.toFixed(0) + "°C" : "—"}`,
-    `功耗 ${g.power_w !== null ? g.power_w.toFixed(1) + " W" : "—"}`,
-  ].join(" · ");
+  const stats = [
+    ["VRAM", `${fmtBytes(g.vram_used_bytes)} / ${fmtBytes(g.vram_total_bytes)}`, pct !== null ? `${pct.toFixed(1)}%` : "—"],
+    ["利用率", g.gpu_util_percent !== null ? g.gpu_util_percent.toFixed(0) : "—", "%"],
+    ["温度", g.temp_c !== null ? g.temp_c.toFixed(0) : "—", "°C"],
+    ["功耗", g.power_w !== null ? g.power_w.toFixed(1) : "—", "W"],
+  ].map(([l, v, u]) =>
+    `<div class="gpu-stat"><div class="label">${l}</div><div class="value">${v}<span class="unit">${u}</span></div></div>`
+  ).join("");
   el.innerHTML = `<div class="label">显卡</div>
     <div class="value" style="font-size:16px">${escHtml(g.name)}</div>
     ${bar}
-    <div class="sub">${sub}</div>`;
+    <div class="gpu-stats">${stats}</div>`;
 }
 
 // ---- 多模型 Router：单行渲染 ----
@@ -450,7 +597,7 @@ function modelRowHtml(m) {
     ? `<button class="mm-unload danger" data-model="${escHtml(m.id)}" ${inAction || state === "loading" ? "disabled" : ""}>卸载</button>`
     : "";
   const btnProbe = `<button class="mm-probe" data-model="${escHtml(m.id)}" ${probing || inAction || !lastHealth ? "disabled" : ""}>测速</button>`;
-  return `<div class="row" style="margin-bottom:8px">
+  return `<div class="model-row ${state === "loaded" ? "is-loaded" : ""}">
     <div style="flex:1;min-width:0">
       <div class="value" style="font-size:14px">${escHtml(m.id)} ${badge} ${vision}</div>
       <div class="sub">${sub}</div>
@@ -483,9 +630,7 @@ function renderPower(p) {
       ${suspendBtn}
     </div>
     <div class="row" style="margin-top:10px">
-      <label style="display:flex;align-items:center;gap:6px;cursor:pointer">
-        <input type="checkbox" id="chk-auto-power" ${p.auto_power_saver ? "checked" : ""}> 模型休眠自动切省电
-      </label>
+      <label class="switch-wrap" style="display:inline-flex;align-items:center;gap:10px;cursor:pointer"><span class="switch"><input type="checkbox" id="chk-auto-power" ${p.auto_power_saver ? "checked" : ""}><span class="slider"></span></span><span>模型休眠自动切省电</span></label>
     </div>
     <div id="power-err"></div>`;
 }
@@ -642,7 +787,7 @@ function renderStatus(data) {
     if (cur !== null && cur !== undefined && !opts.some(([v]) => v === cur)) {
       opts.push([cur, fmtSleep(cur)]);
     }
-    sleepIdleHtml = `<div class="row" style="margin-top:10px">
+    sleepIdleHtml = `<div class="row sleep-bar">
       <span class="label">空闲自动卸载</span>
       <select id="sel-sleep-idle">
         ${opts.map(([v, l]) => `<option value="${v}" ${cur === v ? "selected" : ""}>${l}</option>`).join("")}
