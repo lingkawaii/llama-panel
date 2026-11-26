@@ -99,14 +99,13 @@ kv-unified = true
 flash-attn = on
 ```
 
-配合启动命令：
+配合启动命令（空闲休眠时长由 `models.ini` 统一控制，不要在命令行重复传 `--sleep-idle-seconds` 以免覆盖 INI 配置）：
 
 ```bash
 llama-server \
   --models-preset /path/to/models.ini \
   --models-max 1 \
   --models-autoload \
-  --sleep-idle-seconds 600 \
   --metrics \
   --host 0.0.0.0 --port 8080
 ```
