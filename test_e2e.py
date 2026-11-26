@@ -779,7 +779,8 @@ def test_parse_slot_timings():
     """纯函数单测：parse_slot_timings_from_logs + enrich_slots。
 
     覆盖：推理中 next_token[0].n_decoded 优先、空闲时日志回填 n_decoded、
-    速度指标回填、兼容旧版 speed 不覆盖。
+    速度指标回填、兼容旧版 speed 不覆盖、真实实时行（n_gen/tg）解析、
+    enrich_slots 不就地污染输入 speed、timings_cache 在日志被刷屏后保留速度。
     """
     from llama_panel.client import (
         parse_slot_timings_from_logs, enrich_slots
@@ -831,6 +832,34 @@ def test_parse_slot_timings():
     enriched3 = enrich_slots(slots3, [])
     assert enriched3[0]["speed"]["prompt_n_per_second"] == 999.0
     assert enriched3[0]["speed"]["decoded_n_per_second"] == 999.0
+    # 真实实时行（llama-server 推理进行中）解析：n_gen / tg
+    real_line = ("[53521] 2.23.942.905 I slot print_timing: id  0 | task 201 | "
+                 "n_gen =    332, tg = 110.11 t/s, tg_3s = 110.44 t/s")
+    real = parse_slot_timings_from_logs([real_line])
+    assert real[(0, 201)]["decoded_n"] == 332
+    assert real[(0, 201)]["decoded_n_per_second"] == 110.11
+    # enrich_slots 不就地污染输入 slot["speed"]
+    input_slot = {
+        "id": 0, "is_processing": False, "n_ctx": 4096,
+        "n_prompt_tokens": 22, "n_decoded": 0, "id_task": 201,
+        "speed": {"prompt_n_per_second": 1.0},
+    }
+    original_speed = dict(input_slot["speed"])
+    out = enrich_slots([input_slot], [real_line])
+    assert input_slot["speed"] == original_speed  # 入参未被就地修改
+    assert "decoded_n_per_second" not in input_slot["speed"]
+    assert out[0]["n_decoded"] == 332
+    assert out[0]["speed"]["prompt_n_per_second"] == 1.0  # 已有值不覆盖
+    assert out[0]["speed"]["decoded_n_per_second"] == 110.11  # 新值回填
+    # 日志被无关行刷满后，仍可从 timings_cache 保留 (0, 201) 的速度与 decoded_n
+    cache: dict[tuple[int, int], dict] = {}
+    enrich_slots([{"id": 0, "id_task": 201, "n_decoded": 0}], [real_line], cache)
+    flushed = [
+        f"proxy_request: slot {i % 4} received chat request" for i in range(300)
+    ]
+    kept = enrich_slots([{"id": 0, "id_task": 201, "n_decoded": 0}], flushed, cache)
+    assert kept[0]["n_decoded"] == 332
+    assert kept[0]["speed"]["decoded_n_per_second"] == 110.11
     print("C) slot timings parsing & enrichment unit tests passed")
 def main():
     test_gpu_parsers()

@@ -167,7 +167,7 @@ def parse_model_state(models_payload: dict | None) -> dict:
 
 _TIMING_RE = re.compile(
     r"slot print_timing:\s+id\s+(\d+)\s+\|\s+task\s+(\d+)\s+\|"
-    r"\s+\d+\s+tg\s*=\s*(\d+)\s+t/s"
+    r"\s+n_gen\s*=\s*(\d+),\s*tg\s*=\s*([\d.]+)\s*t/s"
 )
 _TIMING_PROMPT_RE = re.compile(
     r"slot print_timing:\s+id\s+(\d+)\s+\|\s+task\s+(\d+)\s+\|"
@@ -222,28 +222,47 @@ def parse_slot_timings_from_logs(lines: list[str]) -> dict[tuple[int, int], dict
     return result
 
 
-def enrich_slots(slots: list[dict], log_lines: list[str] | None = None) -> list[dict]:
+def enrich_slots(
+    slots: list[dict],
+    log_lines: list[str] | None = None,
+    timings_cache: dict[tuple[int, int], dict] | None = None,
+) -> list[dict]:
     """回填槽位的生成 tokens 与速度指标。
 
     - 推理中优先读 next_token[0].n_decoded 填入 n_decoded；
     - 空闲时若 n_decoded 被上游清零为 0，也用日志里的最终 decoded_n 回填；
     - 按 (id, id_task) 用日志解析结果回填缺失的 speed.prompt_n_per_second
       与 speed.decoded_n_per_second；
-    - 若上游已有 speed 字段（兼容旧版 llama.cpp 和 mock），不覆盖已有值。
+    - 若上游已有 speed 字段（兼容旧版 llama.cpp 和 mock），不覆盖已有值，
+      且先对已有 speed 做浅拷贝，避免就地修改调用方入参；
+    - timings_cache（可选）：把本次从 log_lines 解析出的 timings 合并进缓存
+      （超过 64 条时删最旧键），查找以合并后的缓存为准，防止 proxy_request
+      刷屏把真实 timing 行冲出日志窗口后丢失槽位速度。
     """
     if not slots:
         return slots
-    if log_lines is not None:
-        timings = parse_slot_timings_from_logs(log_lines)
+    new_timings = (
+        parse_slot_timings_from_logs(log_lines) if log_lines is not None else {}
+    )
+    if timings_cache is None:
+        timings = new_timings
     else:
-        timings = {}
+        for k, v in new_timings.items():
+            if k in timings_cache:
+                del timings_cache[k]  # 重新插入，标记为最近出现
+            timings_cache[k] = v
+        while len(timings_cache) > 64:
+            timings_cache.pop(next(iter(timings_cache)))  # 删最旧键
+        timings = timings_cache
     enriched: list[dict] = []
     for slot in slots:
         s = dict(slot)
         speed = s.get("speed")
         if speed is None:
             speed = {}
-            s["speed"] = speed
+        else:
+            speed = dict(speed)  # 浅拷贝，避免就地修改调用方入参
+        s["speed"] = speed
         # 推理中：优先 next_token[0].n_decoded
         if s.get("n_decoded") is None and isinstance(s.get("next_token"), list):
             nt = s["next_token"][0] if s["next_token"] else None

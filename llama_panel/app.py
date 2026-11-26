@@ -123,6 +123,12 @@ def create_app(
     unload_cooldown_until = 0.0
     UNLOAD_COOLDOWN_SEC = 5.0
 
+    # 槽位速度内存缓存：键为 (slot_id, task_id)，/api/status 每次解析日志时
+    # 合并进 enrich_slots，防止 proxy_request 刷屏把真实 timing 行冲出日志
+    # 窗口后丢失槽位速度。子进程重启后旧 task_id 会串味，故在服务停止/
+    # 重启、模型加载/卸载及预设修改重启时清空。
+    slot_timing_cache: dict[tuple[int, int], dict] = {}
+
     def _external_pid() -> int | None:
         """面板未管理但 server 健康时，按端口发现本机外部进程 PID。"""
         if _host not in _LOCAL_HOSTS or _port is None:
@@ -201,13 +207,13 @@ def create_app(
                 in_cooldown = time.monotonic() < unload_cooldown_until
                 if ms["state"] == "loaded" and ms["model_id"] and not in_cooldown:
                     slots = client.slots(ms["model_id"])
-                    slots = enrich_slots(slots, proc.tail(150))
+                    slots = enrich_slots(slots, proc.tail(300), slot_timing_cache)
                     metrics = client.metrics(ms["model_id"])
                 else:
                     slots, metrics = [], None
             else:
                 slots = client.slots()
-                slots = enrich_slots(slots, proc.tail(150))
+                slots = enrich_slots(slots, proc.tail(300), slot_timing_cache)
                 metrics = client.metrics()
         models_list = parse_models_list(models)
         # 自动省电联动：auto 开启且 Router 模式，检测状态跃迁自动切档
@@ -265,6 +271,7 @@ def create_app(
             unload_cooldown_until = 0.0
             result = client.load_model(model)
         if result.get("ok"):
+            slot_timing_cache.clear()
             _auto_power_from_models()
         return jsonify(result), (200 if result.get("ok") else 502)
 
@@ -284,6 +291,7 @@ def create_app(
             else:
                 unload_cooldown_until = 0.0
         if result.get("ok"):
+            slot_timing_cache.clear()
             _auto_power_from_models()
         return jsonify(result), (200 if result.get("ok") else 502)
 
@@ -330,6 +338,7 @@ def create_app(
                 svc.stop()
             except RuntimeError as e:
                 return jsonify({"ok": False, "error": str(e)}), 500
+            slot_timing_cache.clear()
             return jsonify({"ok": True})
         if proc.is_running():
             proc.stop()
@@ -337,6 +346,7 @@ def create_app(
             ext = _external_pid()
             if ext is not None:
                 kill_pid(ext)
+        slot_timing_cache.clear()
         return jsonify({"ok": True})
 
     @app.post("/api/server/restart")
@@ -346,6 +356,7 @@ def create_app(
                 svc.restart()
             except RuntimeError as e:
                 return jsonify({"ok": False, "error": str(e)}), 500
+            slot_timing_cache.clear()
             return jsonify({"ok": True})
         # 非 systemd：先停后启
         if proc.is_running():
@@ -360,6 +371,7 @@ def create_app(
             return jsonify({"ok": False, "error": str(e)}), 409
         except OSError as e:
             return jsonify({"ok": False, "error": str(e)}), 500
+        slot_timing_cache.clear()
         return jsonify({"ok": True, "pid": pid})
 
     @app.post("/api/preset/sleep-idle")
@@ -414,6 +426,8 @@ def create_app(
             except (RuntimeError, OSError) as e:
                 return jsonify({"ok": False, "error": f"重启失败: {e}"}), 500
             result["restarted"] = restarted
+            if restarted:
+                slot_timing_cache.clear()
         return jsonify(result)
 
     @app.post("/api/power/profile")
