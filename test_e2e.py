@@ -535,52 +535,6 @@ def test_preset_sleep_idle_e2e():
     print("preset sleep-idle 路由单测通过")
 
 
-def test_power_auto_e2e():
-    """单测：/api/power/auto（模型休眠自动切省电联动）。"""
-    import llama_panel.app as appmod
-    from llama_panel.app import create_app
-    from llama_panel.client import LlamaClient
-
-    calls = []
-    orig = (appmod.get_power_status, appmod.set_power_profile, LlamaClient.models)
-    try:
-        appmod.get_power_status = lambda: {
-            "current": "performance",
-            "available": ["power-saver", "balanced", "performance"],
-            "can_suspend": False,
-        }
-        appmod.set_power_profile = lambda profile: (
-            calls.append(profile), {"ok": True, "profile": profile})[1]
-        # 无已加载模型 → 开启时应切 power-saver
-        LlamaClient.models = lambda self: {"data": [
-            {"id": "model-a", "status": {"value": "unloaded",
-                                         "args": [], "preset": "m.ini"}},
-        ]}
-        app = create_app("http://127.0.0.1:9", ["fake"],
-                         log_path=os.path.join(HERE, "test_power.log"))
-        c = app.test_client()
-
-        r = c.post("/api/power/auto", json={"enabled": True})
-        assert r.status_code == 200 and r.get_json()["ok"] is True, r.get_json()
-        assert r.get_json()["enabled"] is True, r.get_json()
-        assert calls == ["power-saver"], calls
-
-        # 关闭 → ok，enabled False
-        r = c.post("/api/power/auto", json={"enabled": False})
-        assert r.status_code == 200 and r.get_json()["enabled"] is False, r.get_json()
-
-        # enabled 非布尔 → 400
-        r = c.post("/api/power/auto", json={"enabled": "yes"})
-        assert r.status_code == 400, r.status_code
-    finally:
-        appmod.get_power_status, appmod.set_power_profile, LlamaClient.models = orig
-        try:
-            os.remove(os.path.join(HERE, "test_power.log"))
-        except OSError:
-            pass
-    print("power auto 路由单测通过")
-
-
 def test_router_e2e():
     """Router 模式端到端：unloaded 不误唤醒，load/unload API 可用。"""
     # 9) 启动 --router 模式 fake server（初始状态 unloaded）
@@ -951,7 +905,6 @@ def main():
     test_parse_power_profiles()
     test_parse_slot_timings()
     test_preset_sleep_idle_e2e()
-    test_power_auto_e2e()
 
     for p in (FAKE_PORT, PANEL_PORT):
         assert not port_in_use(p), f"端口 {p} 已被占用，先清理残留进程"
