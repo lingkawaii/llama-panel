@@ -148,6 +148,25 @@
   .gpu-stat .label { color: var(--muted); font-size: 11px; }
   .gpu-stat .value { font-size: 15px; font-weight: 600; font-variant-numeric: tabular-nums; margin-top: 2px; }
   .gpu-stat .value .unit { font-size: 11px; color: var(--muted); margin-left: 4px; font-weight: 400; }
+  .svc-stats { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; margin-top: 10px; }
+  @media (max-width: 640px) {
+    .svc-stats { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  }
+  .svc-stat {
+    background: rgba(9, 11, 16, 0.55); border: 1px solid var(--border);
+    border-radius: 10px; padding: 8px 10px;
+  }
+  .svc-stat .label { color: var(--muted); font-size: 11px; }
+  .svc-stat .value { font-size: 15px; font-weight: 600; font-variant-numeric: tabular-nums; margin-top: 2px; }
+  .svc-stat .value .unit { font-size: 11px; color: var(--muted); margin-left: 4px; font-weight: 400; }
+  #proc-cmd {
+    margin-top: 10px; padding: 6px 12px; min-height: 22px;
+    background: rgba(9, 11, 16, 0.55); border: 1px solid var(--border);
+    border-radius: 999px;
+    font-family: ui-monospace, SFMono-Regular, Consolas, "Courier New", monospace;
+    font-size: 12px; line-height: 1.4;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }
   .model-row {
     background: rgba(9, 11, 16, 0.5); border: 1px solid var(--border);
     border-radius: 10px; padding: 10px 12px;
@@ -264,6 +283,7 @@
           </span>
         </div>
         <div class="sub" id="proc-cmd"></div>
+        <div class="svc-stats" id="proc-stats"></div>
         <div class="err-bar" id="proc-err" hidden></div>
       </div>
     </section>
@@ -719,7 +739,10 @@ function renderStatus(data) {
         ? `运行中（外部）· PID ${p.pid}`
         : `运行中 · PID ${p.pid}${p.uptime !== null && p.uptime !== undefined ? ` · ${fmtUptime(p.uptime)}` : ""}`)
     : "未运行";
-  $("proc-cmd").textContent = p.external ? "（外部启动，非面板拉起）" : p.command.join(" ");
+  const cmdText = p.external ? "（外部启动，非面板拉起）" : p.command.join(" ");
+  const cmdEl = $("proc-cmd");
+  cmdEl.textContent = cmdText;
+  cmdEl.title = cmdText;
   if (!busy) {
     $("btn-start").disabled = p.running;
     $("btn-stop").disabled = !p.running;
@@ -846,6 +869,23 @@ function renderStatus(data) {
     : mstate === "unloaded"
       ? `<tr><td colspan="7" class="muted">模型已休眠卸载（点击「加载模型」或发起请求后恢复）</td></tr>`
       : `<tr><td colspan="7" class="muted">无槽位</td></tr>`;
+
+  // 服务遥测 2×2（与右侧 GPU 卡视觉对称）
+  const healthColor = s.health ? "var(--ok)" : "var(--err)";
+  const hostSrc = p.external ? "外部"
+    : (p.command && p.command[0] && /^systemd:/.test(p.command[0])) ? p.command[0]
+    : "面板拉起";
+  const loadedN = modelsList.filter((m) => (m.state || "none") === "loaded").length;
+  const totalModels = modelsList.length || (mid ? 1 : 0);
+  const busyN = slots.filter((x) => x.is_processing).length;
+  $("proc-stats").innerHTML = [
+    ["接口健康", `<span style="color:${healthColor}">${s.health ? "健康" : "离线"}</span>`, router ? "Router 模式" : "单模型"],
+    ["托管方式", p.running ? escHtml(hostSrc) : "—", p.running ? `PID ${p.pid ?? "—"}` : ""],
+    ["运行时长", p.running ? fmtUptime(p.uptime) : "未运行", ""],
+    ["模型 / 槽位", p.running ? `${loadedN} / ${totalModels} 已加载` : "—", p.running ? `${busyN} / ${slots.length} 槽位忙` : ""],
+  ].map(([l, v, u]) =>
+    `<div class="svc-stat"><div class="label">${l}</div><div class="value">${v}${u ? `<span class="unit">${u}</span>` : ""}</div></div>`
+  ).join("");
 }
 
 function slotRows(s) {
