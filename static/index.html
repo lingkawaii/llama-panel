@@ -705,13 +705,14 @@ function renderStatus(data) {
 
 function slotRows(s) {
   const sp = s.speed || {};
+  const n_decoded = s.n_decoded ?? sp.decoded_n ?? (s.next_token?.[0]?.n_decoded ?? null);
   const busy = s.is_processing;
   return `<tr>
     <td>${s.id ?? "?"}</td>
     <td><span class="tag ${busy ? "busy" : "idle"}">${busy ? "处理中" : "空闲"}</span></td>
     <td>${fmt(s.n_ctx)}</td>
     <td>${fmt(s.n_prompt_tokens ?? sp.prompt_n)}</td>
-    <td>${fmt(s.n_decoded ?? sp.decoded_n)}</td>
+    <td>${fmt(n_decoded)}</td>
     <td>${fmt(sp.prompt_n_per_second, " tok/s")}</td>
     <td>${fmt(sp.decoded_n_per_second, " tok/s")}</td>
   </tr>`;

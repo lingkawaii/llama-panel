@@ -165,6 +165,106 @@ def parse_model_state(models_payload: dict | None) -> dict:
     }
 
 
+_TIMING_RE = re.compile(
+    r"slot print_timing:\s+id\s+(\d+)\s+\|\s+task\s+(\d+)\s+\|"
+    r"\s+\d+\s+tg\s*=\s*(\d+)\s+t/s"
+)
+_TIMING_PROMPT_RE = re.compile(
+    r"slot print_timing:\s+id\s+(\d+)\s+\|\s+task\s+(\d+)\s+\|"
+    r"\s+prompt\s+eval\s+time\s*=\s*[\d.]+\s+ms\s*/\s*(?P<tokens>\d+)\s+tokens"
+    r"\s+\(\s*[\d.]+\s+ms\s+per\s+token,\s*(?P<tps>[\d.]+)\s+tokens\s+per\s+second\)"
+)
+_TIMING_DECODED_RE = re.compile(
+    r"slot print_timing:\s+id\s+(\d+)\s+\|\s+task\s+(\d+)\s+\|"
+    r"\s+eval\s+time\s+=\s+(?P<ms>[\d.]+)\s+ms\s*/\s*(?P<tokens>\d+)\s+tokens"
+    r"\s+\(\s*[\d.]+\s+ms\s+per\s+token,\s*(?P<tps>[\d.]+)\s+tokens\s+per\s+second\)"
+)
+
+
+def parse_slot_timings_from_logs(lines: list[str]) -> dict[tuple[int, int], dict]:
+    """从 llama-server 日志行解析每个 slot 的最终性能数据。
+
+    返回 {(slot_id, task_id): {"prompt_n", "prompt_n_per_second",
+                                "decoded_n", "decoded_n_per_second"}}。
+    同一 (slot_id, task_id) 只保留最后一次出现的值。
+    """
+    result: dict[tuple[int, int], dict] = {}
+    for line in lines:
+        tg_m = _TIMING_RE.search(line)
+        if tg_m:
+            slot_id, task_id = int(tg_m.group(1)), int(tg_m.group(2))
+            entry = result.get((slot_id, task_id))
+            if entry is None:
+                entry = {}
+                result[(slot_id, task_id)] = entry
+            entry["decoded_n"] = int(tg_m.group(3))
+            entry["decoded_n_per_second"] = float(tg_m.group(4))
+            continue
+        prompt_m = _TIMING_PROMPT_RE.search(line)
+        if prompt_m:
+            slot_id, task_id = int(prompt_m.group(1)), int(prompt_m.group(2))
+            entry = result.get((slot_id, task_id))
+            if entry is None:
+                entry = {}
+                result[(slot_id, task_id)] = entry
+            entry["prompt_n"] = int(prompt_m.group(3))
+            entry["prompt_n_per_second"] = float(prompt_m.group(4))
+            continue
+        dec_m = _TIMING_DECODED_RE.search(line)
+        if dec_m:
+            slot_id, task_id = int(dec_m.group(1)), int(dec_m.group(2))
+            entry = result.get((slot_id, task_id))
+            if entry is None:
+                entry = {}
+                result[(slot_id, task_id)] = entry
+            entry["decoded_n"] = int(dec_m.group("tokens"))
+            entry["decoded_n_per_second"] = float(dec_m.group("tps"))
+    return result
+
+
+def enrich_slots(slots: list[dict], log_lines: list[str] | None = None) -> list[dict]:
+    """回填槽位的生成 tokens 与速度指标。
+
+    - 推理中优先读 next_token[0].n_decoded 填入 n_decoded；
+    - 空闲时若 n_decoded 被上游清零为 0，也用日志里的最终 decoded_n 回填；
+    - 按 (id, id_task) 用日志解析结果回填缺失的 speed.prompt_n_per_second
+      与 speed.decoded_n_per_second；
+    - 若上游已有 speed 字段（兼容旧版 llama.cpp 和 mock），不覆盖已有值。
+    """
+    if not slots:
+        return slots
+    if log_lines is not None:
+        timings = parse_slot_timings_from_logs(log_lines)
+    else:
+        timings = {}
+    enriched: list[dict] = []
+    for slot in slots:
+        s = dict(slot)
+        speed = s.get("speed")
+        if speed is None:
+            speed = {}
+            s["speed"] = speed
+        # 推理中：优先 next_token[0].n_decoded
+        if s.get("n_decoded") is None and isinstance(s.get("next_token"), list):
+            nt = s["next_token"][0] if s["next_token"] else None
+            if isinstance(nt, dict) and "n_decoded" in nt:
+                s["n_decoded"] = nt["n_decoded"]
+        # 空闲时若 n_decoded 为 0 且日志有最终值，回填
+        key = (s["id"], s.get("id_task", 0))
+        if s.get("n_decoded") is None or s.get("n_decoded") == 0:
+            t = timings.get(key)
+            if t and t.get("decoded_n") is not None:
+                s["n_decoded"] = t["decoded_n"]
+        # 回填速度指标（不覆盖已有值）
+        if key in timings:
+            t = timings[key]
+            if "prompt_n_per_second" not in speed and "prompt_n_per_second" in t:
+                speed["prompt_n_per_second"] = t["prompt_n_per_second"]
+            if "decoded_n_per_second" not in speed and "decoded_n_per_second" in t:
+                speed["decoded_n_per_second"] = t["decoded_n_per_second"]
+        enriched.append(s)
+    return enriched
+
 class LlamaClient:
     """对 llama-server 的只读查询封装。所有方法在失败时返回 None/[] 而非抛异常。"""
 

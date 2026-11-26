@@ -10,7 +10,7 @@ from urllib.parse import urlparse
 
 from flask import Flask, jsonify, request, send_from_directory
 
-from .client import LlamaClient, parse_model_state, parse_models_list
+from .client import LlamaClient, parse_model_state, parse_models_list, enrich_slots
 from .gpu import get_gpu_stats
 from .preset import update_sleep_idle_in_ini
 from .power import PROFILES, get_power_status, set_power_profile, trigger_suspend
@@ -201,11 +201,13 @@ def create_app(
                 in_cooldown = time.monotonic() < unload_cooldown_until
                 if ms["state"] == "loaded" and ms["model_id"] and not in_cooldown:
                     slots = client.slots(ms["model_id"])
+                    slots = enrich_slots(slots, proc.tail(150))
                     metrics = client.metrics(ms["model_id"])
                 else:
                     slots, metrics = [], None
             else:
                 slots = client.slots()
+                slots = enrich_slots(slots, proc.tail(150))
                 metrics = client.metrics()
         models_list = parse_models_list(models)
         # 自动省电联动：auto 开启且 Router 模式，检测状态跃迁自动切档

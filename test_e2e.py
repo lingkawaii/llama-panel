@@ -775,6 +775,63 @@ def test_multi_model_e2e(fake2):
     return fake3
 
 
+def test_parse_slot_timings():
+    """纯函数单测：parse_slot_timings_from_logs + enrich_slots。
+
+    覆盖：推理中 next_token[0].n_decoded 优先、空闲时日志回填 n_decoded、
+    速度指标回填、兼容旧版 speed 不覆盖。
+    """
+    from llama_panel.client import (
+        parse_slot_timings_from_logs, enrich_slots
+    )
+
+    log = [
+        "slot print_timing: id  0 | task 201 | task 332 tg = 110.11 t/s, tg_3s = 110.44 t/s",
+        "slot print_timing: id  0 | task 201 | prompt eval time =      93.72 ms /    22 tokens (    4.26 ms per token,   234.73 tokens per second)",
+        "slot print_timing: id  0 | task 201 |        eval time =    3608.79 ms /   400 tokens (    9.04 ms per token,   110.56 tokens per second)",
+        "slot print_timing: id  1 | task 305 | task 100 tg = 95.00 t/s, tg_3s = 94.00 t/s",
+        "slot print_timing: id  1 | task 305 | prompt eval time =     200.00 ms /    50 tokens (    4.00 ms per token,   250.00 tokens per second)",
+        "slot print_timing: id  1 | task 305 |        eval time =    1052.63 ms /   100 tokens (   10.53 ms per token,   100.00 tokens per second)",
+    ]
+    timings = parse_slot_timings_from_logs(log)
+    assert timings == {
+        (0, 201): {"decoded_n": 400, "decoded_n_per_second": 110.56,
+                   "prompt_n": 22, "prompt_n_per_second": 234.73},
+        (1, 305): {"decoded_n": 100, "decoded_n_per_second": 100.00,
+                   "prompt_n": 50, "prompt_n_per_second": 250.00},
+    }
+    # 空日志
+    assert parse_slot_timings_from_logs([]) == {}
+    # 空 slots
+    assert enrich_slots([]) == []
+    # 推理中：next_token[0].n_decoded 优先于日志
+    slots = [
+        {"id": 0, "is_processing": True, "n_ctx": 4096,
+         "n_prompt_tokens": 22, "next_token": [{"n_decoded": 50}], "id_task": 201},
+    ]
+    enriched = enrich_slots(slots, log)
+    assert enriched[0]["n_decoded"] == 50
+    assert enriched[0]["speed"]["prompt_n_per_second"] == 234.73
+    assert enriched[0]["speed"]["decoded_n_per_second"] == 110.56
+    # 空闲时 n_decoded=0，从日志回填
+    slots2 = [
+        {"id": 1, "is_processing": False, "n_ctx": 4096,
+         "n_prompt_tokens": 50, "n_decoded": 0, "id_task": 305},
+    ]
+    enriched2 = enrich_slots(slots2, log)
+    assert enriched2[0]["n_decoded"] == 100
+    assert enriched2[0]["speed"]["prompt_n_per_second"] == 250.00
+    assert enriched2[0]["speed"]["decoded_n_per_second"] == 100.00
+    # 兼容旧版：上游已有 speed 不覆盖
+    slots3 = [
+        {"id": 2, "is_processing": False, "n_ctx": 4096,
+         "n_prompt_tokens": 10, "n_decoded": 5, "id_task": 0,
+         "speed": {"prompt_n_per_second": 999.0, "decoded_n_per_second": 999.0}},
+    ]
+    enriched3 = enrich_slots(slots3, [])
+    assert enriched3[0]["speed"]["prompt_n_per_second"] == 999.0
+    assert enriched3[0]["speed"]["decoded_n_per_second"] == 999.0
+    print("C) slot timings parsing & enrichment unit tests passed")
 def main():
     test_gpu_parsers()
     test_parse_systemd_uptime()
@@ -782,7 +839,7 @@ def main():
     test_parse_models_list()
     test_update_sleep_idle_in_ini()
     test_parse_power_profiles()
-    test_model_routes()
+    test_parse_slot_timings()
     test_preset_sleep_idle_e2e()
     test_power_auto_e2e()
 
