@@ -516,6 +516,34 @@ function kvHit(m) {
   return cached / total * 100;
 }
 
+// 新版 llama.cpp 的 gauge（*_tokens_seconds）恒为 0，真实数据在累计计数器里：
+// 优先用 gauge，否则用 tokens_total / seconds_total 计算平均速度
+function genSpeed(m) {
+  if (!m) return null;
+  const gauge = metricValue(m, "llamacpp:predicted_tokens_seconds");
+  if (typeof gauge === "number" && gauge > 0) return gauge;
+  const tokens = metricValue(m, "llamacpp:tokens_predicted_total");
+  const seconds = metricValue(m, "llamacpp:tokens_predicted_seconds_total");
+  if (typeof seconds === "number" && seconds > 0 && typeof tokens === "number" && tokens >= 0) {
+    return tokens / seconds;
+  }
+  if (gauge === 0) return 0;
+  return null;
+}
+
+function promptSpeed(m) {
+  if (!m) return null;
+  const gauge = metricValue(m, "llamacpp:prompt_tokens_seconds");
+  if (typeof gauge === "number" && gauge > 0) return gauge;
+  const tokens = metricValue(m, "llamacpp:prompt_tokens_total");
+  const seconds = metricValue(m, "llamacpp:prompt_seconds_total");
+  if (typeof seconds === "number" && seconds > 0 && typeof tokens === "number" && tokens >= 0) {
+    return tokens / seconds;
+  }
+  if (gauge === 0) return 0;
+  return null;
+}
+
 function cardHtml(label, value, unit) {
   if (value === null || value === undefined) {
     return `<div class="card"><div class="label">${label}</div>
@@ -530,9 +558,36 @@ function cardHtml(label, value, unit) {
 const TREND_MAX = 60;
 const trend = { gen: [], prompt: [], vram: [], temp: [] };
 
+// 上一次观测到的累计计数器（模型重启计数器变小时自动重置）
+let prevGenCounters = null;    // [tokens_predicted_total, tokens_predicted_seconds_total]
+let prevPromptCounters = null; // [prompt_tokens_total, prompt_seconds_total]
+
+function counterDeltaSpeed(prev, curTokens, curSeconds) {
+  if (curTokens === null || curTokens === undefined ||
+      curSeconds === null || curSeconds === undefined) return [null, prev];
+  if (prev === null || curTokens < prev[0]) return [null, [curTokens, curSeconds]];
+  const dSec = curSeconds - prev[1];
+  const dTok = curTokens - prev[0];
+  const speed = (dSec > 0 && dTok >= 0) ? dTok / dSec : null;
+  return [speed, [curTokens, curSeconds]];
+}
+
 function pushTrend(m, g) {
-  trend.gen.push(m ? metricValue(m, "llamacpp:predicted_tokens_seconds") : null);
-  trend.prompt.push(m ? metricValue(m, "llamacpp:prompt_tokens_seconds") : null);
+  let gen = null, prompt = null;
+  if (m) {
+    const [gs, genPrev] = counterDeltaSpeed(prevGenCounters,
+      metricValue(m, "llamacpp:tokens_predicted_total"),
+      metricValue(m, "llamacpp:tokens_predicted_seconds_total"));
+    prevGenCounters = genPrev;
+    const [ps, promptPrev] = counterDeltaSpeed(prevPromptCounters,
+      metricValue(m, "llamacpp:prompt_tokens_total"),
+      metricValue(m, "llamacpp:prompt_seconds_total"));
+    prevPromptCounters = promptPrev;
+    gen = gs !== null ? gs : genSpeed(m);
+    prompt = ps !== null ? ps : promptSpeed(m);
+  }
+  trend.gen.push(gen);
+  trend.prompt.push(prompt);
   trend.vram.push(g && g.vram_percent !== null && g.vram_percent !== undefined ? g.vram_percent : null);
   trend.temp.push(g && g.temp_c !== null && g.temp_c !== undefined ? g.temp_c : null);
   for (const k of Object.keys(trend)) {
@@ -840,8 +895,8 @@ function renderStatus(data) {
   const processing = m ? metricValue(m, "llamacpp:requests_processing") : null;
   const deferred = m ? metricValue(m, "llamacpp:requests_deferred") : null;
   const cards = [
-    ["生成速度", m ? metricValue(m, "llamacpp:predicted_tokens_seconds") : null, "tok/s"],
-    ["提示词速度", m ? metricValue(m, "llamacpp:prompt_tokens_seconds") : null, "tok/s"],
+    ["生成速度", genSpeed(m), "tok/s"],
+    ["提示词速度", promptSpeed(m), "tok/s"],
     ["spec 接受率", specAccept(m), "%"],
     ["KV 缓存命中率", kvHit(m), "%"],
     ["上下文高水位", m ? metricValue(m, "llamacpp:n_tokens_max") : null, "tok"],
