@@ -121,6 +121,12 @@
     background: rgba(255, 255, 255, 0.14); border-radius: 4px; }
   #logs::-webkit-scrollbar-thumb:hover { background: rgba(255, 255, 255, 0.22); }
   #logs::-webkit-scrollbar-track { background: transparent; }
+  .log-line { display: block; }
+  .log-err { color: #ff7b72; }
+  .log-warn { color: #e3b341; }
+  .log-speed { color: #56d364; }
+  .log-event { color: #79c0ff; }
+  .log-muted { color: #6e7681; }
   .tag { display: inline-block; padding: 1px 8px; border-radius: 10px; font-size: 12px; }
   .tag.busy { background: rgba(52, 211, 153, .15); color: var(--ok); }
   .tag.idle { background: rgba(160, 160, 170, .15); color: var(--muted); }
@@ -945,19 +951,32 @@ function filteredLogs() {
   return logLines.filter(logMatch);
 }
 
+function logLineClass(line) {
+  if (/ E |error|failed|exception/i.test(line)) return "log-err";
+  if (/ W |warn/i.test(line)) return "log-warn";
+  if (/print_timing|eval time|draft acceptance|tg =/i.test(line)) return "log-speed";
+  if (/load:|unload|evicting|stopping model/i.test(line)) return "log-event";
+  if (/proxy_reques/.test(line)) return "log-muted";
+  return "";
+}
+
 function renderLogs() {
   const box = $("logs");
   const atBottom = box.scrollHeight - box.scrollTop - box.clientHeight < 20;
-  let text;
+  let html;
   if (!logLines.length) {
     // 日志文件有内容就直接显示（外部/systemd 启动也一样）
-    text = lastProc && lastProc.running
+    html = lastProc && lastProc.running
       ? "无日志：将 --log 指向服务的日志文件，或用面板「启动」接管。"
       : "无日志";
   } else {
-    text = filteredLogs().join("\n") || "（无匹配日志）";
+    html = filteredLogs().map((line) => {
+      const cls = logLineClass(line);
+      return `<span class="log-line${cls ? " " + cls : ""}">${escHtml(line)}</span>`;
+    }).join("");
+    if (!html) html = "（无匹配日志）";
   }
-  box.textContent = text;
+  box.innerHTML = html;
   if (!logPaused && atBottom) box.scrollTop = box.scrollHeight;
 }
 
