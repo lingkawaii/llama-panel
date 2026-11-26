@@ -228,6 +228,18 @@ def test_probe_ok():
     print("probe ok:", d)
 
 
+def test_chat_ok():
+    """端到端：POST /api/chat 空 prompt → 400 + ok False；合法 prompt → 200 + ok True + content。"""
+    status, d = post_json("/api/chat", {"prompt": "   "})
+    assert status == 400 and d["ok"] is False, f"空 prompt 应 400: {status} {d}"
+    assert d.get("error") == "提示词不能为空", d
+    status, d = post_json("/api/chat", {"prompt": "Say hello", "max_tokens": 64})
+    assert status == 200 and d["ok"] is True, f"chat 应成功: {status} {d}"
+    assert isinstance(d["content"], str) and d["content"], d
+    assert d["elapsed_s"] is not None and d["elapsed_s"] >= 0, d
+    print("chat ok:", d)
+
+
 def test_probe_down():
     """端到端：server 停止后 POST /api/probe 返回 502 + ok False。"""
     status, d = post_raw("/api/probe")
@@ -1021,6 +1033,9 @@ def main():
 
         # 6b) server 运行时一键测速
         test_probe_ok()
+
+        # 6c) 快捷对话试跑
+        test_chat_ok()
 
         # 7) 重启：先停后启，实际进程 pid 必须变化
         r = post("/api/server/restart")

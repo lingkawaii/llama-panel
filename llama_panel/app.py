@@ -8,6 +8,8 @@ import threading
 import time
 from urllib.parse import urlparse
 
+import requests
+
 from flask import Flask, jsonify, request, send_from_directory
 
 from .client import LlamaClient, parse_model_state, parse_models_list, enrich_slots
@@ -374,6 +376,77 @@ def create_app(
             unload_cooldown_until = 0.0
         result = client.probe(model)
         return jsonify(result), (200 if result.get("ok") else 502)
+
+    @app.post("/api/chat")
+    def api_chat():
+        """快捷对话试跑：向上游发单轮 chat 请求，返回回复与速度指标。
+
+        body: {"model": str|None, "prompt": str, "max_tokens": int (默认 512, 上限 4096)}
+        空 prompt → 400；上游异常/非 200 → ok False。
+        """
+        data = request.get_json(silent=True)
+        if not isinstance(data, dict):
+            return jsonify({"ok": False, "error": "请求体须为 JSON 对象"}), 400
+        prompt = data.get("prompt")
+        if not isinstance(prompt, str) or not prompt.strip():
+            return jsonify({"ok": False, "error": "提示词不能为空"}), 400
+        model = data.get("model")
+        if not isinstance(model, str) or not model:
+            model = None
+        max_tokens = data.get("max_tokens", 512)
+        if isinstance(max_tokens, bool) or not isinstance(max_tokens, int):
+            try:
+                max_tokens = int(max_tokens)
+            except (TypeError, ValueError):
+                max_tokens = 512
+        max_tokens = max(16, min(max_tokens, 4096))
+        payload = {
+            "messages": [{"role": "user", "content": prompt.strip()}],
+            "max_tokens": max_tokens,
+            "stream": False,
+        }
+        if model:
+            payload["model"] = model
+        try:
+            start = time.monotonic()
+            r = requests.post(
+                server_url.rstrip("/") + "/v1/chat/completions",
+                json=payload, timeout=120,
+            )
+            dt = time.monotonic() - start
+            if r.status_code != 200:
+                return jsonify({"ok": False, "error": f"上游返回 HTTP {r.status_code}"})
+            body = r.json()
+        except requests.RequestException as e:
+            return jsonify({"ok": False, "error": f"请求失败: {e}"})
+        except ValueError:
+            return jsonify({"ok": False, "error": "响应不是合法 JSON"})
+        if not isinstance(body, dict):
+            return jsonify({"ok": False, "error": "响应不是合法 JSON"})
+        content = ""
+        reasoning = ""
+        choices = body.get("choices")
+        if isinstance(choices, list) and choices and isinstance(choices[0], dict):
+            msg = choices[0].get("message")
+            if isinstance(msg, dict):
+                c = msg.get("content")
+                content = c if isinstance(c, str) else ""
+                rz = msg.get("reasoning_content")
+                reasoning = rz if isinstance(rz, str) else ""
+        timings = body.get("timings")
+        if not isinstance(timings, dict):
+            timings = {}
+        return jsonify({
+            "ok": True,
+            "model": body.get("model"),
+            "content": content,
+            "reasoning": reasoning,
+            "elapsed_s": round(dt, 2),
+            "prompt_n": timings.get("prompt_n"),
+            "predicted_n": timings.get("predicted_n"),
+            "prompt_per_second": timings.get("prompt_per_second"),
+            "predicted_per_second": timings.get("predicted_per_second"),
+        })
 
     @app.post("/api/server/start")
     def api_server_start():

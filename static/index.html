@@ -244,6 +244,19 @@
   .log-f.active {
     background: var(--accent-soft); border-color: rgba(91, 140, 255, 0.55); color: #c7d7ff;
   }
+  #chat-input {
+    background: rgba(9, 11, 16, 0.6); color: var(--fg);
+    border: 1px solid var(--border); border-radius: 8px;
+    padding: 5px 10px; font-size: 13px;
+    transition: border-color .15s ease, background .15s ease;
+  }
+  #chat-input:hover { border-color: var(--border-strong); }
+  #chat-input:focus { outline: none; border-color: rgba(91, 140, 255, 0.6);
+    box-shadow: 0 0 0 3px rgba(91, 140, 255, 0.12); }
+  #chat-out { white-space: pre-wrap; font-size: 13px; }
+  .chat-pill { display: inline-block; padding: 1px 8px; border-radius: 10px;
+    font-size: 12px; background: rgba(91, 140, 255, 0.12); color: var(--accent);
+    margin-right: 6px; margin-bottom: 4px; }
   .hidden { display: none !important; }
   #confirm-modal {
     position: fixed; inset: 0;
@@ -308,6 +321,17 @@
   <section>
     <h2>模型</h2>
     <div class="card" id="model-card"><span class="muted">加载中…</span></div>
+    <div class="card" style="margin-top:12px">
+      <details id="chat-box">
+        <summary>快捷试跑（发一句话验货）</summary>
+        <div class="row" style="margin-top:8px">
+          <select id="chat-model" style="flex:1;min-width:0"></select>
+          <input id="chat-input" type="text" placeholder="输入测试提示词，回车发送…" style="flex:2;min-width:120px">
+          <button id="btn-chat-send" class="btn-primary">发送</button>
+        </div>
+        <div id="chat-out" style="margin-top:10px"></div>
+      </details>
+    </div>
   </section>
 
   <section id="power-section" class="hidden">
@@ -802,6 +826,9 @@ function renderStatus(data) {
     + `<div class="sub" id="probe-result">${probeResultHtml}</div>`
     + sleepIdleHtml;
 
+  // 快捷试跑：同步模型下拉（保留用户已选值；单模型则填当前 mid）
+  syncChatModel(modelsList, mid);
+
   // 显卡 / VRAM
   renderGpu(data.gpu);
 
@@ -1088,6 +1115,62 @@ async function modelAction(kind, model) {
   modelBusy = null;
   fetchStatus();
 }
+
+// ---- 快捷对话试跑（Quick Chat）----
+let chatBusy = false;
+function syncChatModel(modelsList, mid) {
+  const sel = $("chat-model");
+  if (!sel) return;
+  const cur = sel.value;
+  const opts = modelsList.length ? modelsList.map((m) => m.id).filter(Boolean)
+    : (mid ? [mid] : []);
+  sel.innerHTML = opts.map((id) => `<option value="${escHtml(id)}">${escHtml(id)}</option>`).join("");
+  if (opts.length === 1) sel.value = opts[0];
+  else if (opts.includes(cur)) sel.value = cur;
+  else if (mid && opts.includes(mid)) sel.value = mid;
+}
+function renderChatOut(d) {
+  const out = $("chat-out");
+  if (!d.ok) {
+    out.innerHTML = `<span style="color:var(--err)">${escHtml(d.error || "请求失败")}</span>`;
+    return;
+  }
+  const pills = [];
+  if (d.elapsed_s !== null && d.elapsed_s !== undefined) pills.push(`耗时 ${d.elapsed_s}s`);
+  if (d.prompt_per_second !== null && d.prompt_per_second !== undefined) pills.push(`提示词 ${d.prompt_per_second.toFixed(0)} tok/s`);
+  if (d.predicted_per_second !== null && d.predicted_per_second !== undefined) pills.push(`生成 ${d.predicted_per_second.toFixed(1)} tok/s`);
+  if (d.predicted_n !== null && d.predicted_n !== undefined) pills.push(`生成 ${d.predicted_n} tokens`);
+  let html = "";
+  if (pills.length) html += `<div style="margin-bottom:8px">${pills.map((p) => `<span class="chat-pill">${escHtml(p)}</span>`).join("")}</div>`;
+  if (d.reasoning) html += `<details style="margin-bottom:8px"><summary>思考过程</summary><div style="white-space:pre-wrap;color:var(--muted);font-size:12px">${escHtml(d.reasoning)}</div></details>`;
+  html += `<div style="white-space:pre-wrap">${escHtml(d.content || "")}</div>`;
+  out.innerHTML = html;
+}
+async function sendChat() {
+  if (chatBusy) return;
+  const prompt = $("chat-input").value;
+  if (!prompt.trim()) { renderChatOut({ ok: false, error: "提示词不能为空" }); return; }
+  chatBusy = true;
+  const btn = $("btn-chat-send");
+  btn.disabled = true; btn.textContent = "发送中…";
+  $("chat-out").innerHTML = '<span class="muted">推理中…</span>';
+  const body = { prompt, max_tokens: 512 };
+  const sel = $("chat-model");
+  if (sel.value) body.model = sel.value;
+  try {
+    const r = await fetch("/api/chat", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    renderChatOut(await r.json());
+  } catch (e) {
+    $("chat-out").innerHTML = `<span style="color:var(--err)">请求失败: ${escHtml(e)}</span>`;
+  }
+  chatBusy = false;
+  btn.disabled = false; btn.textContent = "发送";
+}
+$("btn-chat-send").onclick = sendChat;
+$("chat-input").addEventListener("keydown", (e) => { if (e.key === "Enter") sendChat(); });
 
 $("model-card").addEventListener("click", (e) => {
   if (e.target.id === "btn-probe" && !e.target.disabled) runProbe();
