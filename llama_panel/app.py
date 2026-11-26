@@ -129,6 +129,15 @@ def create_app(
     # 重启、模型加载/卸载及预设修改重启时清空。
     slot_timing_cache: dict[tuple[int, int], dict] = {}
 
+    # 真实推理活跃追踪（Router 模式）：/api/status 轮询本身会重置
+    # llama-server 的 --sleep-idle-seconds 空闲计时器，故只有「真实活动」
+    # （槽位处理中 / token 数增长）才能作为空闲计时基准；无活动超过
+    # sleep_idle_seconds 时由面板主动卸载。均在 model_lock 保护下，
+    # 时间基准为 time.monotonic()。
+    idle_track_model: str | None = None
+    last_inference_ts: float = 0.0
+    last_token_total: float | None = None
+
     def _external_pid() -> int | None:
         """面板未管理但 server 健康时，按端口发现本机外部进程 PID。"""
         if _host not in _LOCAL_HOSTS or _port is None:
@@ -193,8 +202,18 @@ def create_app(
     def index():
         return send_from_directory(_STATIC, "index.html")
 
+    def _metric_value(metrics: dict[str, float] | None, name: str) -> float | None:
+        """按指标名取值（key 可能带 {...} 标签）；metrics 为空或缺失返回 None。"""
+        if not metrics:
+            return None
+        for k, v in metrics.items():
+            if k.split("{", 1)[0] == name:
+                return v
+        return None
+
     @app.get("/api/status")
     def api_status():
+        nonlocal unload_cooldown_until, idle_track_model, last_inference_ts, last_token_total
         # 持锁完成「查模型状态 → 查 slots/metrics」整段，
         # 避免卸载在中间插入、对卸载中/刚卸载的模型发 ?model= 请求误唤醒。
         with model_lock:
@@ -215,6 +234,41 @@ def create_app(
                 slots = client.slots()
                 slots = enrich_slots(slots, proc.tail(300), slot_timing_cache)
                 metrics = client.metrics()
+            # 真实推理活跃追踪：纯轮询不延长空闲计时，仅槽位处理中或
+            # token 数增长算活动；无活动超过 sleep_idle_seconds 时由面板
+            # 主动卸载（llama-server 自身空闲计时器被轮询不断重置，永不触发）。
+            if ms["router_mode"]:
+                now = time.monotonic()
+                if ms["state"] == "loaded" and ms["model_id"] and not in_cooldown:
+                    pt = _metric_value(metrics, "llamacpp:prompt_tokens_total")
+                    tp = _metric_value(metrics, "llamacpp:tokens_predicted_total")
+                    tok_total = (pt + tp) if (pt is not None and tp is not None) else None
+                    active = (
+                        idle_track_model != ms["model_id"]
+                        or any(s.get("is_processing") for s in slots)
+                        or (tok_total is not None and last_token_total is not None
+                            and tok_total > last_token_total)
+                    )
+                    if active:
+                        idle_track_model = ms["model_id"]
+                        last_inference_ts = now
+                        last_token_total = tok_total
+                    else:
+                        sleep_idle = ms["sleep_idle_seconds"]
+                        if (isinstance(sleep_idle, int) and sleep_idle > 0
+                                and (now - last_inference_ts) >= sleep_idle):
+                            res = client.unload_model(ms["model_id"])
+                            if res.get("ok"):
+                                unload_cooldown_until = now + UNLOAD_COOLDOWN_SEC
+                                slot_timing_cache.clear()
+                                idle_track_model = None
+                                last_token_total = None
+                                slots, metrics = [], None
+                                models = client.models()
+                                ms = parse_model_state(models)
+                elif ms["state"] != "loaded":
+                    idle_track_model = None
+                    last_token_total = None
         models_list = parse_models_list(models)
         # 自动省电联动：auto 开启且 Router 模式，检测状态跃迁自动切档
         power_status = get_power_status()
@@ -262,13 +316,16 @@ def create_app(
     @app.post("/api/model/load")
     def api_model_load():
         """Router 模式手动加载模型（唤醒）。body 可选 {"model": "..."}。"""
-        nonlocal unload_cooldown_until
+        nonlocal unload_cooldown_until, idle_track_model, last_token_total
         model = _resolve_model()
         if not model:
             return jsonify({"ok": False, "error": "未指定 model，且当前无法从 /v1/models 获取 model_id"}), 400
         with model_lock:
-            # 主动加载：立即恢复 /api/status 的 /slots /metrics 查询。
+            # 主动加载：立即恢复 /api/status 的 /slots /metrics 查询；
+            # 重置活跃追踪，空闲计时自下次 status 首次观测重新起算。
             unload_cooldown_until = 0.0
+            idle_track_model = None
+            last_token_total = None
             result = client.load_model(model)
         if result.get("ok"):
             slot_timing_cache.clear()
@@ -278,13 +335,16 @@ def create_app(
     @app.post("/api/model/unload")
     def api_model_unload():
         """Router 模式手动卸载模型释放显存。body 可选 {"model": "..."}。"""
-        nonlocal unload_cooldown_until
+        nonlocal unload_cooldown_until, idle_track_model, last_token_total
         model = _resolve_model()
         if not model:
             return jsonify({"ok": False, "error": "未指定 model，且当前无法从 /v1/models 获取 model_id"}), 400
         with model_lock:
-            # 先进入冷却期：卸载期间 status 轮询不再请求 /slots /metrics。
+            # 先进入冷却期：卸载期间 status 轮询不再请求 /slots /metrics；
+            # 同时重置活跃追踪。
             unload_cooldown_until = time.monotonic() + UNLOAD_COOLDOWN_SEC
+            idle_track_model = None
+            last_token_total = None
             result = client.unload_model(model)
             if result.get("ok"):
                 unload_cooldown_until = time.monotonic() + UNLOAD_COOLDOWN_SEC
@@ -333,11 +393,15 @@ def create_app(
 
     @app.post("/api/server/stop")
     def api_server_stop():
+        nonlocal idle_track_model, last_token_total
         if svc is not None:
             try:
                 svc.stop()
             except RuntimeError as e:
                 return jsonify({"ok": False, "error": str(e)}), 500
+            with model_lock:
+                idle_track_model = None
+                last_token_total = None
             slot_timing_cache.clear()
             return jsonify({"ok": True})
         if proc.is_running():
@@ -346,16 +410,23 @@ def create_app(
             ext = _external_pid()
             if ext is not None:
                 kill_pid(ext)
+        with model_lock:
+            idle_track_model = None
+            last_token_total = None
         slot_timing_cache.clear()
         return jsonify({"ok": True})
 
     @app.post("/api/server/restart")
     def api_server_restart():
+        nonlocal idle_track_model, last_token_total
         if svc is not None:
             try:
                 svc.restart()
             except RuntimeError as e:
                 return jsonify({"ok": False, "error": str(e)}), 500
+            with model_lock:
+                idle_track_model = None
+                last_token_total = None
             slot_timing_cache.clear()
             return jsonify({"ok": True})
         # 非 systemd：先停后启
@@ -371,6 +442,9 @@ def create_app(
             return jsonify({"ok": False, "error": str(e)}), 409
         except OSError as e:
             return jsonify({"ok": False, "error": str(e)}), 500
+        with model_lock:
+            idle_track_model = None
+            last_token_total = None
         slot_timing_cache.clear()
         return jsonify({"ok": True, "pid": pid})
 

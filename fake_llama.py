@@ -2,6 +2,8 @@
 
 --router 模式：模拟 llama-server Router 模式
 （--models-preset ... --models-autoload --sleep-idle-seconds 600）：
+- --sleep-idle N：模拟 --sleep-idle-seconds（默认 600）
+- /debug/metrics?prompt=N&predicted=N：修改 token 累计值，模拟推理活动
 - /v1/models 的 data 每项带 status（value/args/preset），仅 loaded 时带 meta；初始状态 unloaded
 - 多模型：--model 可多次指定，每个模型独立 load/unload 状态（模拟 --models-max 1）
 - /slots 与 /metrics 必须带 ?model=（否则 400）；unloaded 期间被调用会记录误唤醒计数并模拟 autoload 唤醒
@@ -21,27 +23,37 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 ROUTER = "--router" in sys.argv[1:]
 
 # 解析 --model（可多次）；未指定时默认单模型 qwen3.8-27b
+# --sleep-idle N：模拟 --sleep-idle-seconds（默认 600）
 MODELS: list[str] = []
+SLEEP_IDLE = 600
 _argv = sys.argv[1:]
 _i = 0
 while _i < len(_argv):
     if _argv[_i] == "--model" and _i + 1 < len(_argv):
         MODELS.append(_argv[_i + 1])
         _i += 2
+    elif _argv[_i] == "--sleep-idle" and _i + 1 < len(_argv):
+        try:
+            SLEEP_IDLE = int(_argv[_i + 1])
+        except ValueError:
+            pass
+        _i += 2
     else:
         _i += 1
 if not MODELS:
     MODELS = ["qwen3.8-27b"]
-SLEEP_IDLE = 600
 
-METRICS_TEXT = (
-    "# HELP llamacpp:predicted_tokens_seconds Prompt processing speed\n"
-    "llamacpp:predicted_tokens_seconds 58.4\n"
-    "# HELP llamacpp:prompt_tokens_seconds Prompt processing speed\n"
-    "llamacpp:prompt_tokens_seconds 820.0\n"
-    "llamacpp:prompt_tokens_total 1234\n"
-    "llamacpp:tokens_predicted_total 567\n"
-)
+
+def metrics_text() -> str:
+    """Prometheus 文本；token 累计值取自 STATE（可用 /debug/metrics 修改）。"""
+    return (
+        "# HELP llamacpp:predicted_tokens_seconds Prompt processing speed\n"
+        "llamacpp:predicted_tokens_seconds 58.4\n"
+        "# HELP llamacpp:prompt_tokens_seconds Prompt processing speed\n"
+        "llamacpp:prompt_tokens_seconds 820.0\n"
+        f"llamacpp:prompt_tokens_total {STATE['prompt_total']}\n"
+        f"llamacpp:tokens_predicted_total {STATE['predicted_total']}\n"
+    )
 
 CHAT_BODY = {
     "id": "chatcmpl-fake",
@@ -70,6 +82,8 @@ STATE = {
     "slots_misfires": 0,   # unloaded 期间 /slots 被调用次数（误唤醒）
     "metrics_misfires": 0,  # unloaded 期间 /metrics 被调用次数（误唤醒）
     "stale_loaded": False,  # /v1/models 报 loaded 即使实际 unloaded（模拟 Router 状态滞后）
+    "prompt_total": 1234,    # llamacpp:prompt_tokens_total 累计值
+    "predicted_total": 567,  # llamacpp:tokens_predicted_total 累计值
 }
 
 
@@ -150,7 +164,7 @@ class H(BaseHTTPRequestHandler):
                 if STATE["models"][model] != "loaded":
                     STATE["metrics_misfires"] += 1
                     STATE["models"][model] = "loaded"
-                self._send_text(200, METRICS_TEXT)
+                self._send_text(200, metrics_text())
             else:
                 self.send_response(501)
                 self.end_headers()
@@ -164,6 +178,17 @@ class H(BaseHTTPRequestHandler):
         elif path == "/debug/stale_loaded" and ROUTER:
             STATE["stale_loaded"] = "clear" not in query
             self._send_json(200, {"stale_loaded": STATE["stale_loaded"]})
+        elif path == "/debug/metrics" and ROUTER:
+            # 修改 token 累计值，模拟推理活动（?prompt=N&predicted=N）
+            for key, q in (("prompt_total", "prompt"), ("predicted_total", "predicted")):
+                val = (query.get(q) or [None])[0]
+                if val is not None:
+                    try:
+                        STATE[key] = int(val)
+                    except ValueError:
+                        pass
+            self._send_json(200, {"prompt_total": STATE["prompt_total"],
+                                  "predicted_total": STATE["predicted_total"]})
         else:
             self.send_response(404)
             self.end_headers()

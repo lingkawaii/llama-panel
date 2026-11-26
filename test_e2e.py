@@ -703,6 +703,75 @@ def test_router_cooldown():
     print("10c) 冷却期后恢复指标查询:", dbg)
 
 
+def test_router_idle_unload(fake2):
+    """空闲自动卸载：Router 模式下 /api/status 轮询不重置空闲计时器。
+
+    杀掉传入的单模型 fake，启动 sleep-idle 2s 的 router fake，
+    返回新 fake 进程供 main() 回收。
+    - 无真实活动：持续轮询超过 sleep_idle 后面板自动卸载，且不误唤醒；
+    - token 增长：重置空闲计时，不卸载。
+    """
+    if fake2 is not None:
+        fake2.kill()
+        try:
+            fake2.wait(timeout=5)
+        except (subprocess.TimeoutExpired, OSError):
+            pass
+    wait_port_free(FAKE_PORT)
+    if os.path.exists(PID_FILE):
+        os.remove(PID_FILE)
+    fake_log = open(os.path.join(HERE, "test_fake_idle.log"), "ab")
+    fake4 = subprocess.Popen(
+        [PY, "fake_llama.py", "--router", "--sleep-idle", "2"],
+        cwd=HERE, stdout=fake_log, stderr=fake_log)
+    wait_pid_file(what="idle fake pid")
+    print("12) idle-unload fake server 已启动")
+
+    # 12a) 加载模型；首次 status 观测建立空闲计时基准，
+    #      此后纯轮询不算活动：超过 sleep_idle（2s）面板应自动卸载
+    code, d = post_raw("/api/model/load")
+    assert code == 200 and d.get("ok") is True, f"load 应成功: {code} {d}"
+    s = wait_status(
+        lambda d: (d["server"].get("model_state") or {}).get("state") == "loaded",
+        "idle test: loaded",
+    )
+    assert s["server"]["model_state"]["sleep_idle_seconds"] == 2, s["server"]["model_state"]
+    assert s["slots"] and s["metrics"], s
+    s = wait_status(
+        lambda d: (d["server"].get("model_state") or {}).get("state") == "unloaded",
+        "idle auto-unload",
+        timeout=20,
+    )
+    assert s["slots"] == [] and s["metrics"] is None, s
+    dbg = fake_get("/debug")
+    assert dbg["state"] == "unloaded", dbg
+    assert dbg["slots_misfires"] == 0 and dbg["metrics_misfires"] == 0, \
+        f"卸载过程误唤醒: {dbg}"
+    print("12a) 空闲自动卸载 ok:", dbg)
+
+    # 12b) token 增长重置空闲计时：重新加载后每次轮询前递增 token 累计值，
+    #      全程（> sleep_idle）模型不得被卸载
+    code, d = post_raw("/api/model/load")
+    assert code == 200 and d.get("ok") is True, f"load 应成功: {code} {d}"
+    wait_status(
+        lambda d: (d["server"].get("model_state") or {}).get("state") == "loaded",
+        "idle test: reloaded",
+    )
+    prompt = 2000
+    for _ in range(5):
+        fake_get(f"/debug/metrics?prompt={prompt}&predicted=600")
+        prompt += 100
+        s = get("/api/status")
+        assert (s["server"]["model_state"] or {}).get("state") == "loaded", \
+            f"token 增长应重置空闲计时，模型不应被卸载: {s['server']['model_state']}"
+    time.sleep(1.0)
+    dbg = fake_get("/debug")
+    assert dbg["state"] == "loaded", f"token 增长期间模型应仍 loaded: {dbg}"
+    assert dbg["slots_misfires"] == 0 and dbg["metrics_misfires"] == 0, dbg
+    print("12b) token 增长不卸载 ok:", dbg)
+    return fake4
+
+
 def test_multi_model_e2e(fake2):
     """多模型 Router 端到端：每模型独立 load/unload，status 指向已加载模型。
 
@@ -886,6 +955,7 @@ def main():
         cwd=HERE, stdout=panel_log, stderr=panel_log)
     fake2 = None
     fake3 = None
+    fake4 = None
     try:
         # 0) 假 server 的真实 pid（本环境 Popen.pid 可能与子进程实际 pid 不同）
         deadline = time.time() + 10
@@ -986,12 +1056,15 @@ def main():
         # 10) 冷却期/并发防误唤醒
         test_router_cooldown()
 
+        # 12) 空闲自动卸载 / 真实活动追踪
+        fake4 = test_router_idle_unload(fake2)
+
         # 11) 多模型 Router 切换
-        fake3 = test_multi_model_e2e(fake2)
+        fake3 = test_multi_model_e2e(fake4)
 
         print("\nALL E2E CHECKS PASSED")
     finally:
-        for proc in (panel, fake3, fake2, fake):
+        for proc in (panel, fake3, fake2, fake4, fake):
             if proc is None:
                 continue
             try:
@@ -1010,7 +1083,8 @@ def main():
         wait_port_free(FAKE_PORT, timeout=5)
         fake_log.close()
         panel_log.close()
-        for f in (PID_FILE, os.path.join(HERE, "test_fake.log"), os.path.join(HERE, "test_panel.log")):
+        for f in (PID_FILE, os.path.join(HERE, "test_fake.log"),
+                  os.path.join(HERE, "test_fake_idle.log"), os.path.join(HERE, "test_panel.log")):
             try:
                 os.remove(f)
             except OSError:
