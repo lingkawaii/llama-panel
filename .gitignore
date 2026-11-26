@@ -27,3 +27,5 @@ htmlcov/
 # Runtime logs
 llama-server.log
 fake_llama.pid
+
+test_*.log
