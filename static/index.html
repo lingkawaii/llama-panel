@@ -932,8 +932,8 @@ function renderStatus(data) {
 
   // 服务遥测 2×2（与右侧 GPU 卡视觉对称）
   const healthColor = s.health ? "var(--ok)" : "var(--err)";
-  const hostSrc = p.external ? "外部"
-    : (p.command && p.command[0] && /^systemd:/.test(p.command[0])) ? p.command[0]
+  const hostSrc = p.external ? "外部进程"
+    : (p.command && p.command[0] && /^systemd:/.test(p.command[0])) ? "systemd 托管"
     : "面板拉起";
   const loadedN = modelsList.filter((m) => (m.state || "none") === "loaded").length;
   const totalModels = modelsList.length || (mid ? 1 : 0);
