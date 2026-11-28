@@ -759,9 +759,9 @@ function renderGpu(g) {
       [mid, `${mid}W 平衡`],
       [pc.max_w, `${pc.max_w}W 满血`],
     ];
-    capBar = `<div class="row sleep-bar">
+    capBar = `<div class="row sleep-bar" style="justify-content:space-between">
       <span class="label">功耗上限</span>
-      <div class="seg">${tiers.map(([w, l]) =>
+      <div class="seg" style="margin-left:auto">${tiers.map(([w, l]) =>
         `<button class="gpu-cap-btn${Math.abs(pc.current_w - w) <= 5 ? " active" : ""}"
              data-watts="${w}">${l}</button>`).join("")}</div>
       <span class="gpu-cap-err" id="gpu-cap-err"></span>
