@@ -309,36 +309,6 @@
     box-shadow: 0 0 0 3px rgba(91, 140, 255, 0.12);
   }
   #tune-err { margin-top: 10px; }
-  .trace-item {
-    background: rgba(9, 11, 16, 0.55); border: 1px solid var(--border);
-    border-radius: 10px; padding: 10px 12px;
-    transition: border-color .15s ease, background .15s ease;
-  }
-  .trace-item + .trace-item { margin-top: 8px; }
-  .trace-item:hover { border-color: var(--border-strong); background: rgba(13, 17, 25, 0.65); }
-  .trace-item > summary {
-    display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 0;
-  }
-  .trace-time { color: var(--muted); font-size: 12px; font-variant-numeric: tabular-nums; }
-  .trace-preview {
-    flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
-    color: var(--muted); font-size: 12px;
-  }
-  .trace-pills { margin-left: auto; display: inline-flex; gap: 4px; flex-wrap: wrap; }
-  .trace-pills .chat-pill { margin: 0; }
-  .trace-body { margin-top: 10px; display: grid; gap: 10px; }
-  .trace-sub > summary { font-size: 12px; }
-  .trace-msg { display: flex; gap: 8px; align-items: flex-start; margin-bottom: 6px; }
-  .trace-role { flex-shrink: 0; background: rgba(160, 160, 170, .15); color: var(--muted); }
-  .trace-msg-text { white-space: pre-wrap; font-size: 12px; min-width: 0; }
-  .trace-block {
-    background: rgba(2, 4, 8, 0.75); border: 1px solid var(--border); border-radius: 8px;
-    padding: 8px 10px; font: 12px/1.6 ui-monospace, Consolas, monospace;
-    white-space: pre-wrap; word-break: break-word;
-  }
-  .trace-label { color: var(--muted); font-size: 12px; }
-  .trace-tool { display: grid; gap: 4px; }
-  .trace-empty { padding: 10px 4px; }
 </style>
 </head>
 <body>
@@ -452,18 +422,6 @@
           <tbody></tbody>
         </table>
       </div>
-    </div>
-  </section>
-
-  <section>
-    <h2>实时会话监控</h2>
-    <div class="card">
-      <div class="row" style="margin-bottom:10px">
-        <span class="muted">代理地址 <code id="proxy-url"></code>（仅内存保留最近 20 条，不落盘）<span id="trace-count" class="muted"></span></span>
-        <span style="flex:1"></span>
-        <button id="btn-traces-clear" class="danger">清空</button>
-      </div>
-      <div id="trace-list"></div>
     </div>
   </section>
 
@@ -1583,128 +1541,25 @@ $("power-card").addEventListener("click", (e) => {
   if (e.target.classList.contains("power-btn") && !e.target.disabled) setPowerProfile(e.target.dataset.profile);
 });
 
-$("btn-refresh").onclick = () => { fetchStatus(); fetchLogs(); fetchTraces(); };
+$("btn-refresh").onclick = () => { fetchStatus(); fetchLogs(); };
 
 $("btn-start").onclick = () => serverAction("/api/server/start", null);
 $("btn-stop").onclick = () => serverAction("/api/server/stop", "确认停止 llama-server 服务？");
 $("btn-restart").onclick = () => serverAction("/api/server/restart", "确认重启 llama-server 服务？");
 
-// ---- 实时会话监控（/v1 代理 traces，仅内存保留最近 20 条）----
-const openTraceIds = new Set(); // 用户手动展开的 trace id（轮询重渲染时保留 open 状态）
-const openTraceSubKeys = new Set(); // 用户手动展开的内部子块（req/think）
-$("proxy-url").textContent = location.origin + "/v1";
-
-function traceSummary(t) {
-  const badge = t.status === "streaming"
-    ? `<span class="tag loading">生成中…</span>`
-    : t.status === "ok"
-      ? `<span class="tag loaded">完成</span>`
-      : `<span class="tag" style="background:rgba(247,92,92,.15);color:var(--err)">失败</span>`;
-  const time = new Date(t.ts * 1000).toTimeString().slice(0, 8);
-  const pills = [];
-  if (t.elapsed_s !== null && t.elapsed_s !== undefined) pills.push(`耗时 ${Number(t.elapsed_s).toFixed(1)}s`);
-  if (t.predicted_per_second !== null && t.predicted_per_second !== undefined) pills.push(`${Number(t.predicted_per_second).toFixed(1)} tok/s`);
-  if (t.tool_calls && t.tool_calls.length) pills.push(`工具 ${t.tool_calls.length}`);
-  const preview = (t.last_user || "").replace(/\s+/g, " ").trim() || "—";
-  return `${badge}
-    <span class="trace-time">${time}</span>
-    <code>${escHtml(t.model || "?")}</code>
-    <span class="trace-preview">${escHtml(preview)}</span>
-    <span class="trace-pills">${pills.map((p) => `<span class="chat-pill">${escHtml(p)}</span>`).join("")}</span>`;
-}
-
-function traceBody(t) {
-  const msgs = t.messages_preview || [];
-  let html = `<details class="trace-sub" data-sub-key="${t.id}:req"${openTraceSubKeys.has(`${t.id}:req`) ? " open" : ""}><summary>请求摘要（共 ${t.messages_count ?? msgs.length} 条）</summary>
-    ${msgs.length
-      ? msgs.map((m) => `<div class="trace-msg"><span class="tag trace-role">${escHtml(m.role || "?")}</span><span class="trace-msg-text">${escHtml(m.text || "")}</span></div>`).join("")
-      : `<span class="muted">—</span>`}
-  </details>`;
-  if (t.reasoning) {
-    html += `<details class="trace-sub" data-sub-key="${t.id}:think"${openTraceSubKeys.has(`${t.id}:think`) ? " open" : ""}><summary>思考过程</summary><div class="trace-block">${escHtml(t.reasoning)}</div></details>`;
-  }
-  if (t.tool_calls && t.tool_calls.length) {
-    html += `<div>
-      <div class="trace-label">工具调用</div>
-      <div style="display:grid;gap:8px;margin-top:6px">
-        ${t.tool_calls.map((tc) => {
-          const fn = tc.function || {};
-          return `<div class="trace-tool"><code>${escHtml(fn.name || "?")}</code><div class="trace-block">${escHtml(fn.arguments || "")}</div></div>`;
-        }).join("")}
-      </div>
-    </div>`;
-  }
-  if (t.content) {
-    html += `<div>
-      <div class="trace-label">模型输出</div>
-      <div class="trace-block" style="margin-top:6px">${escHtml(t.content)}</div>
-    </div>`;
-  }
-  if (t.error) html += `<div class="err-bar">${escHtml(t.error)}</div>`;
-  return html;
-}
-
-function renderTraces(traces) {
-  $("trace-count").textContent = traces.length ? ` · ${traces.length} 条` : "";
-  const list = $("trace-list");
-  if (!traces.length) {
-    list.innerHTML = `<div class="muted trace-empty">暂无代理会话（将 pi / dsh 的 baseUrl 指向当前代理地址即可自动记录）</div>`;
-    return;
-  }
-  list.innerHTML = traces.map((t) =>
-    `<details class="trace-item" data-trace-id="${t.id}"${openTraceIds.has(t.id) ? " open" : ""}>
-      <summary>${traceSummary(t)}</summary>
-      <div class="trace-body">${traceBody(t)}</div>
-    </details>`).join("");
-}
-
-// 记录用户展开/收起状态：轮询重渲染时绝不打断用户阅读
-$("trace-list").addEventListener("toggle", (e) => {
-  const el = e.target; // toggle 事件不冒泡，必须捕获阶段监听
-  if (!el.classList) return;
-  if (el.classList.contains("trace-item")) {
-    const id = Number(el.dataset.traceId);
-    if (el.open) openTraceIds.add(id); else openTraceIds.delete(id);
-  } else if (el.classList.contains("trace-sub")) {
-    const key = el.dataset.subKey;
-    if (el.open) openTraceSubKeys.add(key); else openTraceSubKeys.delete(key);
-  }
-}, true);
-
-async function fetchTraces() {
-  try {
-    const r = await fetch("/api/traces?limit=20");
-    const d = await r.json();
-    renderTraces(d.traces || []);
-  } catch {}
-}
-
-$("btn-traces-clear").onclick = async () => {
-  const btn = $("btn-traces-clear");
-  btn.disabled = true;
-  try { await fetch("/api/traces/clear", { method: "POST" }); } catch {}
-  openTraceIds.clear();
-  openTraceSubKeys.clear();
-  fetchTraces();
-  btn.disabled = false;
-};
-
 // 轮询定时器：后台标签页自动暂停（visibilitychange），切回可见立即刷新并恢复
 let statusTimer = null;
 let logsTimer = null;
-let tracesTimer = null;
 function startPolling() {
   stopPolling();
   statusTimer = setInterval(fetchStatus, 2000);
   logsTimer = setInterval(fetchLogs, 5000);
-  tracesTimer = setInterval(fetchTraces, 2000);
 }
 function stopPolling() {
   if (statusTimer) { clearInterval(statusTimer); statusTimer = null; }
   if (logsTimer) { clearInterval(logsTimer); logsTimer = null; }
-  if (tracesTimer) { clearInterval(tracesTimer); tracesTimer = null; }
 }
-function refreshAll() { fetchStatus(); fetchLogs(); fetchTraces(); }
+function refreshAll() { fetchStatus(); fetchLogs(); }
 refreshAll();
 startPolling();
 document.addEventListener("visibilitychange", () => {

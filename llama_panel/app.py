@@ -14,7 +14,6 @@ import requests
 from flask import Flask, Response, jsonify, request, send_from_directory
 
 from .client import LlamaClient, parse_model_state, parse_models_list, enrich_slots
-from .proxy import TraceStore
 from .gpu import get_gpu_stats, get_host_memory, set_gpu_power_cap
 from .preset import (
     update_sleep_idle_in_ini, read_model_params_in_ini, update_model_params_in_ini,
@@ -122,10 +121,6 @@ def create_app(
     model_lock = threading.Lock()
     unload_cooldown_until = 0.0
     UNLOAD_COOLDOWN_SEC = 5.0
-
-    # /v1/* 透明代理的内存会话追踪：独立锁（TraceStore 内部），
-    # 绝不占用 model_lock；仅存内存不落盘。
-    trace_store = TraceStore(maxlen=20)
 
     # 槽位速度内存缓存：键为 (slot_id, task_id)，/api/status 每次解析日志时
     # 合并进 enrich_slots，防止 proxy_request 刷屏把真实 timing 行冲出日志
@@ -521,115 +516,6 @@ def create_app(
         resp.headers["Cache-Control"] = "no-cache"
         resp.headers["X-Accel-Buffering"] = "no"
         return resp
-
-    # hop-by-hop 请求头：转发时剔除，由 requests 按上游连接重新生成。
-    _HOP_BY_HOP = {"host", "content-length", "transfer-encoding", "connection"}
-
-    @app.route("/v1/<path:subpath>", methods=["GET", "POST", "OPTIONS", "DELETE"])
-    def v1_proxy(subpath):
-        """`/v1/*` 零损耗透明流式反向代理。
-
-        原字节转发查询参数与请求体到上游 `{server_url}/v1/{subpath}`；
-        上游 SSE 时逐块原字节立即 yield 给客户端（同时内存解析喂 trace_store），
-        非流式时读完整字节原样返回。仅 POST /v1/chat/completions 写 trace。
-        """
-        headers = {k: v for k, v in request.headers.items()
-                   if k.lower() not in _HOP_BY_HOP}
-        url = f"{server_url.rstrip('/')}/v1/{subpath}"
-        body = request.get_data()
-        trace = None
-        if request.method == "POST" and subpath == "chat/completions":
-            req_json = request.get_json(silent=True)
-            if isinstance(req_json, dict):
-                trace = trace_store.start_trace(req_json)
-        start = time.monotonic()
-        try:
-            upstream = requests.request(
-                request.method, url, params=request.args, headers=headers,
-                data=body, stream=True, timeout=(10, 600),
-            )
-        except requests.RequestException as e:
-            if trace is not None:
-                trace_store.finish_trace(
-                    trace["id"], time.monotonic() - start, error=f"上游请求失败: {e}")
-            return jsonify({"ok": False, "error": f"上游请求失败: {e}"}), 502
-        ctype = upstream.headers.get("Content-Type", "")
-        if trace is not None and "text/event-stream" in ctype:
-            trace_id = trace["id"]
-            status_code = upstream.status_code
-
-            def generate():
-                buf = b""
-                error = None
-                if status_code != 200:
-                    error = f"上游返回 HTTP {status_code}"
-                try:
-                    for chunk in upstream.iter_content(chunk_size=None):
-                        if not chunk:
-                            continue
-                        # 原字节立即转发给客户端（零损耗）
-                        yield chunk
-                        # 内存中按行缓冲 UTF-8 解码，解析 data: {...} 喂 trace
-                        buf += chunk
-                        while b"\n" in buf:
-                            line, buf = buf.split(b"\n", 1)
-                            text = line.decode("utf-8", errors="replace").strip()
-                            if not text.startswith("data:"):
-                                continue
-                            data_str = text[5:].strip()
-                            if data_str == "[DONE]":
-                                continue
-                            try:
-                                obj = json.loads(data_str)
-                            except ValueError:
-                                continue
-                            if isinstance(obj, dict):
-                                trace_store.feed_sse_chunk(trace_id, obj)
-                except (requests.RequestException, OSError) as e:
-                    error = f"上游流中断: {e}"
-                finally:
-                    try:
-                        upstream.close()
-                    except OSError:
-                        pass
-                    trace_store.finish_trace(
-                        trace_id, time.monotonic() - start, error=error)
-
-            resp = Response(generate(), status=status_code,
-                            mimetype=ctype or "text/event-stream")
-            resp.headers["Cache-Control"] = "no-cache"
-            resp.headers["X-Accel-Buffering"] = "no"
-            return resp
-        # 非流式：读取完整字节原样返回
-        raw = upstream.content
-        upstream.close()
-        if trace is not None:
-            resp_json = None
-            try:
-                parsed = json.loads(raw.decode("utf-8", "replace"))
-                if isinstance(parsed, dict):
-                    resp_json = parsed
-            except ValueError:
-                resp_json = None
-            err = None if upstream.status_code == 200 \
-                else f"上游返回 HTTP {upstream.status_code}"
-            trace_store.finish_trace(
-                trace["id"], time.monotonic() - start, resp_json=resp_json, error=err)
-        return Response(raw, status=upstream.status_code,
-                        mimetype=ctype or "application/octet-stream")
-
-    @app.get("/api/traces")
-    def api_traces():
-        """最近 chat 会话追踪列表（最新在前）。?limit=20。"""
-        limit = request.args.get("limit", 20, type=int)
-        if limit is None or limit < 1:
-            limit = 20
-        return jsonify({"ok": True, "traces": trace_store.list_traces(limit)})
-
-    @app.post("/api/traces/clear")
-    def api_traces_clear():
-        trace_store.clear()
-        return jsonify({"ok": True})
 
     @app.post("/api/server/start")
     def api_server_start():
