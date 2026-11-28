@@ -8,6 +8,7 @@
 - **systemd 托管**：`--systemd-unit` 接入 systemd 单元（`systemctl start/stop/restart`）；uptime 取自 `ActiveEnterTimestampMonotonic`；外部进程按端口自动发现
 - **Router 多模型切换**：识别 `--models-preset --models-autoload` 模式，多模型列表展示、一键加载/卸载、在线修改 `sleep-idle-seconds` 空闲自动卸载时长；`threading.Lock` 串行化 + 卸载后 5 秒冷却期，防止轮询误触发 `--models-autoload`
 - **快捷试跑**：`POST /api/chat` 单轮对话试跑，返回回复与 prefill/decode 速度；`POST /api/probe` 极短探针测速
+- **`/v1/*` 透明流式代理与实时会话监控**：SSE 流式透传 `llama-server`，内存保留最近 20 条会话（不落盘），面板 2 秒轮询实时展示
 - **GPU/VRAM 与真实均值吞吐指标**：`rocm-smi` 优先、`nvidia-smi` 回退，2 秒超时优雅降级；槽位速度从日志 timing 行回填缓存，防刷屏丢失
 - **彩色日志查看器**：关键词搜索、`全部/告警/错误/测速` 过滤、行数切换、暂停滚屏与一键复制
 - **Linux CPU 电源档位**：接入 `powerprofilesctl`，读取并切换 `power-saver / balanced / performance`（非 Linux 自动隐藏）
@@ -94,6 +95,9 @@ sudo systemctl enable --now llama-panel.service
 | GET | `/` | 面板单页前端 |
 | GET | `/api/status` | 聚合状态：`server` / `slots` / `metrics` / `gpu` / `power` |
 | GET | `/api/logs?n=200` | 日志文件末尾 `n` 行 |
+| * | `/v1/*` | 透明代理到 `llama-server`（`POST /v1/chat/completions` 记录会话） |
+| GET | `/api/traces?limit=20` | 最近 20 条代理会话（仅内存，不落盘） |
+| POST | `/api/traces/clear` | 清空代理会话记录 |
 | POST | `/api/chat` | 快捷对话试跑：`{"prompt": "...", "model": "..."(可选), "max_tokens": 512}`，返回回复与速度指标 |
 | POST | `/api/model/load` | Router 模式手动加载/切换模型（body 可选 `{"model": "..."}`） |
 | POST | `/api/model/unload` | Router 模式手动卸载模型，启动 5 秒防误唤醒冷却期 |
