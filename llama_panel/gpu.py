@@ -118,6 +118,59 @@ def parse_nvidia_smi_csv(text: str) -> dict | None:
     )
 
 
+_MEMINFO_KEYS = ("MemTotal", "MemAvailable", "MemFree", "SwapTotal", "SwapFree")
+
+
+def parse_proc_meminfo(text: str) -> dict | None:
+    """解析 /proc/meminfo 文本（数值单位 kB，转字节）。
+
+    MemAvailable 缺失时回退 MemFree；MemTotal <= 0 或解析失败返回 None。
+    """
+    if not text:
+        return None
+    kv: dict[str, int] = {}
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or ":" not in line:
+            continue
+        key, _, rest = line.partition(":")
+        key = key.strip()
+        if key not in _MEMINFO_KEYS:
+            continue
+        parts = rest.split()
+        if not parts:
+            continue
+        try:
+            kv[key] = int(parts[0])
+        except ValueError:
+            continue
+    total = kv.get("MemTotal")
+    if total is None or total <= 0:
+        return None
+    avail = kv.get("MemAvailable")
+    if avail is None:
+        avail = kv.get("MemFree", 0)
+    swap_total = kv.get("SwapTotal", 0)
+    swap_free = kv.get("SwapFree", 0)
+    used = max(0, total - avail)
+    return {
+        "used_bytes": used * 1024,
+        "total_bytes": total * 1024,
+        "percent": round(used * 100.0 / total, 1),
+        "swap_used_bytes": max(0, swap_total - swap_free) * 1024,
+        "swap_total_bytes": swap_total * 1024,
+    }
+
+
+def get_host_memory(meminfo_path: str = "/proc/meminfo") -> dict | None:
+    """读取 /proc/meminfo 返回整机内存用量；文件不存在或异常（如非 Linux）返回 None。"""
+    try:
+        with open(meminfo_path) as f:
+            return parse_proc_meminfo(f.read())
+    except OSError:
+        return None
+
+
 def _find_rocm_smi() -> str | None:
     p = shutil.which("rocm-smi")
     if p:

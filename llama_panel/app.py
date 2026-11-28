@@ -14,7 +14,7 @@ import requests
 from flask import Flask, Response, jsonify, request, send_from_directory
 
 from .client import LlamaClient, parse_model_state, parse_models_list, enrich_slots
-from .gpu import get_gpu_stats, set_gpu_power_cap
+from .gpu import get_gpu_stats, get_host_memory, set_gpu_power_cap
 from .preset import (
     update_sleep_idle_in_ini, read_model_params_in_ini, update_model_params_in_ini,
 )
@@ -247,6 +247,7 @@ def create_app(
                 "slots": slots,
                 "metrics": metrics,
                 "gpu": get_gpu_stats(),
+                "memory": get_host_memory(),
                 "power": power_status,
             }
         )

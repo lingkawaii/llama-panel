@@ -256,6 +256,54 @@ def test_gpu_power_cap():
     print("E) gpu power cap unit tests passed")
 
 
+def test_host_memory():
+    """纯函数单测：parse_proc_meminfo / get_host_memory（临时文件模拟 /proc/meminfo）。"""
+    from llama_panel import gpu
+
+    text = (
+        "MemTotal:       16000000 kB\n"
+        "MemFree:         1000000 kB\n"
+        "MemAvailable:    6000000 kB\n"
+        "Buffers:           50000 kB\n"
+        "SwapTotal:        204800 kB\n"
+        "SwapFree:         102400 kB\n"
+    )
+    m = gpu.parse_proc_meminfo(text)
+    assert m is not None, "应解析成功"
+    assert m["total_bytes"] == 16000000 * 1024, m
+    assert m["used_bytes"] == (16000000 - 6000000) * 1024, m
+    assert m["percent"] == 62.5, m
+    assert m["swap_used_bytes"] == (204800 - 102400) * 1024, m
+    assert m["swap_total_bytes"] == 204800 * 1024, m
+
+    # 缺 MemAvailable → 回退 MemFree；缺 Swap 字段 → 0
+    m2 = gpu.parse_proc_meminfo("MemTotal: 100000 kB\nMemFree: 25000 kB\n")
+    assert m2 is not None, m2
+    assert m2["used_bytes"] == 75000 * 1024, m2
+    assert m2["percent"] == 75.0, m2
+    assert m2["swap_used_bytes"] == 0 and m2["swap_total_bytes"] == 0, m2
+
+    # 非法 / 空文本 / MemTotal <= 0 → None
+    assert gpu.parse_proc_meminfo("") is None
+    assert gpu.parse_proc_meminfo("no keys here\n") is None
+    assert gpu.parse_proc_meminfo("MemTotal: abc kB\n") is None
+    assert gpu.parse_proc_meminfo("MemTotal:       0 kB\nMemAvailable: 0 kB\n") is None
+    assert gpu.parse_proc_meminfo("MemTotal: -5 kB\n") is None
+
+    # get_host_memory：临时文件正常读取；文件不存在 → None
+    tmp_dir = tempfile.mkdtemp(prefix="meminfo_test_")
+    try:
+        tmp = os.path.join(tmp_dir, "meminfo")
+        with open(tmp, "w") as f:
+            f.write(text)
+        m3 = gpu.get_host_memory(tmp)
+        assert m3 == m, m3
+        assert gpu.get_host_memory(os.path.join(tmp_dir, "missing")) is None
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+    print("F) host memory unit tests passed")
+
+
 def test_parse_systemd_uptime():
     """纯函数单测：ActiveEnterTimestampMonotonic 微秒值 → 运行时长秒数。"""
     from llama_panel.app import parse_systemd_uptime
@@ -1147,6 +1195,7 @@ def test_parse_slot_timings():
 def main():
     test_gpu_parsers()
     test_gpu_power_cap()
+    test_host_memory()
     test_parse_systemd_uptime()
     test_parse_model_state()
     test_parse_models_list()

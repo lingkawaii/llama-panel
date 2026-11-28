@@ -222,6 +222,12 @@
     margin-top: 12px; padding-top: 10px; border-top: 1px solid var(--border);
     display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
   }
+  .ram-bar {
+    margin-top: 12px; padding-top: 10px; border-top: 1px solid var(--border);
+    display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+  }
+  .ram-bar .bar { flex: 1 1 120px; margin-top: 0; }
+  .ram-bar .ram-val { font-size: 12px; color: var(--muted); font-variant-numeric: tabular-nums; white-space: nowrap; }
   .legend-dot {
     display: inline-block; width: 8px; height: 8px; border-radius: 50%;
     margin-right: 5px; vertical-align: baseline;
@@ -344,6 +350,7 @@
         </div>
         <div class="sub" id="proc-cmd"></div>
         <div class="svc-stats" id="proc-stats"></div>
+        <div id="proc-ram"></div>
         <div class="err-bar" id="proc-err" hidden></div>
       </div>
     </section>
@@ -1067,6 +1074,25 @@ function renderStatus(data) {
   ].map(([l, v, u]) =>
     `<div class="svc-stat"><div class="label">${l}</div><div class="value">${v}${u ? `<span class="unit">${u}</span>` : ""}</div></div>`
   ).join("");
+
+  // 整机内存（Linux /proc/meminfo；非 Linux 时 memory 为 null，整行隐藏）
+  const mem = data.memory;
+  const ramEl = $("proc-ram");
+  if (mem) {
+    const cls = mem.percent > 92 ? "err" : mem.percent > 80 ? "warn" : "accent";
+    const gib = (b) => (b / 1073741824).toFixed(1);
+    let txt = `${gib(mem.used_bytes)} / ${gib(mem.total_bytes)} GiB（${mem.percent.toFixed(1)}%）`;
+    if (mem.swap_used_bytes >= 10 * 1024 * 1024) {
+      txt += ` · Swap ${Math.round(mem.swap_used_bytes / 1048576)} MB`;
+    }
+    ramEl.innerHTML = `<div class="row ram-bar">
+      <span class="label">系统内存</span>
+      <div class="bar"><div class="bar-fill ${cls}" style="width:${Math.min(100, mem.percent)}%"></div></div>
+      <span class="ram-val">${txt}</span>
+    </div>`;
+  } else {
+    ramEl.innerHTML = "";
+  }
 }
 
 function slotRows(s) {
