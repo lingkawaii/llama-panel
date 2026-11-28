@@ -1083,7 +1083,7 @@ function renderStatus(data) {
     const gib = (b) => (b / 1073741824).toFixed(1);
     let txt = `${gib(mem.used_bytes)} / ${gib(mem.total_bytes)} GiB（${mem.percent.toFixed(1)}%）`;
     if (mem.swap_used_bytes >= 10 * 1024 * 1024) {
-      txt += ` · Swap ${Math.round(mem.swap_used_bytes / 1048576)} MB`;
+      txt += ` · Swap ${mem.swap_used_bytes < 0.1 * 1073741824 ? (mem.swap_used_bytes / 1073741824).toFixed(2) : gib(mem.swap_used_bytes)} GiB`;
     }
     ramEl.innerHTML = `<div class="row ram-bar">
       <span class="label">系统内存</span>
