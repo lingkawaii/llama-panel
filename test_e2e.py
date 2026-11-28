@@ -1,7 +1,9 @@
 """端到端测试：外部进程识别 + 启停/重启 + GPU 字段与解析单测。"""
 import json
 import os
+import shutil
 import socket
+import tempfile
 import subprocess
 import sys
 import threading
@@ -193,6 +195,67 @@ def test_gpu_parsers():
     print("A) gpu parser unit tests passed")
 
 
+def test_gpu_power_cap():
+    """纯函数单测：get_gpu_power_cap / set_gpu_power_cap（临时目录模拟 hwmon）。"""
+    from llama_panel import gpu
+
+    tmp = tempfile.mkdtemp(prefix="hwmon_test_")
+    try:
+        def w(name, val):
+            with open(os.path.join(tmp, name), "w") as f:
+                f.write(str(val))
+        # 微瓦 → 瓦特：当前 150W，min 50W，max 300W，default 250W
+        w("power1_cap", 150 * 1_000_000)
+        w("power1_cap_min", 50 * 1_000_000)
+        w("power1_cap_max", 300 * 1_000_000)
+        w("power1_cap_default", 250 * 1_000_000)
+
+        cap = gpu.get_gpu_power_cap(tmp)
+        assert cap is not None, "应找到 hwmon 目录"
+        assert cap["current_w"] == 150, cap
+        assert cap["min_w"] == 50, cap
+        assert cap["max_w"] == 300, cap
+        assert cap["default_w"] == 250, cap
+        assert cap["writable"] is True, cap
+
+        # 合法写入
+        r = gpu.set_gpu_power_cap(200, tmp)
+        assert r == {"ok": True, "watts": 200}, r
+        with open(os.path.join(tmp, "power1_cap")) as f:
+            assert f.read().strip() == str(200 * 1_000_000)
+        assert gpu.get_gpu_power_cap(tmp)["current_w"] == 200
+
+        # 边界值可写
+        assert gpu.set_gpu_power_cap(50, tmp)["ok"] is True
+        assert gpu.set_gpu_power_cap(300, tmp)["ok"] is True
+
+        # 越界
+        r = gpu.set_gpu_power_cap(49, tmp)
+        assert r["ok"] is False and "越界" in r["error"], r
+        r = gpu.set_gpu_power_cap(301, tmp)
+        assert r["ok"] is False and "越界" in r["error"], r
+
+        # 非整数 / 布尔
+        assert gpu.set_gpu_power_cap(150.5, tmp)["ok"] is False
+        assert gpu.set_gpu_power_cap(True, tmp)["ok"] is False
+        assert gpu.set_gpu_power_cap("150", tmp)["ok"] is False
+        assert gpu.set_gpu_power_cap(None, tmp)["ok"] is False
+
+        # 缺文件 → None / 不可用
+        tmp2 = tempfile.mkdtemp(prefix="hwmon_test2_")
+        try:
+            assert gpu.get_gpu_power_cap(tmp2) is None
+            assert gpu.set_gpu_power_cap(100, tmp2)["ok"] is False
+        finally:
+            shutil.rmtree(tmp2, ignore_errors=True)
+
+        # 自动查找：无匹配目录时返回 None（非 Linux 或无 drm）
+        assert gpu.get_gpu_power_cap() is None or isinstance(gpu.get_gpu_power_cap(), dict)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    print("E) gpu power cap unit tests passed")
+
+
 def test_parse_systemd_uptime():
     """纯函数单测：ActiveEnterTimestampMonotonic 微秒值 → 运行时长秒数。"""
     from llama_panel.app import parse_systemd_uptime
@@ -238,6 +301,35 @@ def test_chat_ok():
     assert isinstance(d["content"], str) and d["content"], d
     assert d["elapsed_s"] is not None and d["elapsed_s"] >= 0, d
     print("chat ok:", d)
+
+
+def test_chat_stream():
+    """端到端：POST /api/chat/stream 空 prompt → 400；合法 prompt → 200 + text/event-stream + content/done 事件。"""
+    req = urllib.request.Request(
+        f"http://127.0.0.1:{PANEL_PORT}/api/chat/stream",
+        data=json.dumps({"prompt": "   "}).encode(),
+        headers={"Content-Type": "application/json"}, method="POST",
+    )
+    try:
+        urllib.request.urlopen(req, timeout=25)
+        raise AssertionError("空 prompt 应返回 400")
+    except urllib.error.HTTPError as e:
+        assert e.code == 400, f"空 prompt 应 400: {e.code}"
+        d = json.loads(e.read())
+        assert d["ok"] is False and d.get("error") == "提示词不能为空", d
+    req = urllib.request.Request(
+        f"http://127.0.0.1:{PANEL_PORT}/api/chat/stream",
+        data=json.dumps({"prompt": "Say hello", "max_tokens": 64}).encode(),
+        headers={"Content-Type": "application/json"}, method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=25) as r:
+        assert r.status == 200, r.status
+        ctype = r.headers.get("Content-Type", "")
+        assert "text/event-stream" in ctype, f"Content-Type 异常: {ctype!r}"
+        body = r.read().decode()
+    assert '"type": "content"' in body or '"type":"content"' in body, body
+    assert '"type": "done"' in body or '"type":"done"' in body, body
+    print("chat stream ok")
 
 
 def test_probe_down():
@@ -449,6 +541,162 @@ def test_update_sleep_idle_in_ini():
     assert out.startswith("[*]"), out
     assert "sleep-idle-seconds = 120" in out, out
     print("update_sleep_idle_in_ini 单测通过")
+
+
+def test_model_params_ini():
+    """纯函数单测：read/update_model_params_in_ini（读取/修改/插入/移除/跨节隔离/非法参数）。"""
+    from llama_panel.preset import (
+        MODEL_PARAM_KEYS, read_model_params_in_ini, update_model_params_in_ini,
+    )
+    assert MODEL_PARAM_KEYS == ("temp", "ctx-size", "reasoning-budget", "reasoning-effort")
+
+    ini = (
+        "version = 1\n"
+        "\n"
+        "[*]\nsleep-idle-seconds = 600\n"
+        "\n"
+        "[model-a]\n"
+        "temp = 0.8\n"
+        "ctx-size = 4096\n"
+        "# keep me\n"
+        "reasoning-effort = high\n"
+        "\n"
+        "[model-b]\n"
+        "temp = 1.5\n"
+        "model = /path/b.gguf\n"
+    )
+
+    # 读取：缺失键为 None；节不存在返回 None
+    p = read_model_params_in_ini(ini, "model-a")
+    assert p == {"temp": "0.8", "ctx-size": "4096",
+                 "reasoning-budget": None, "reasoning-effort": "high"}, p
+    p2 = read_model_params_in_ini(ini, "model-b")
+    assert p2 == {"temp": "1.5", "ctx-size": None,
+                  "reasoning-budget": None, "reasoning-effort": None}, p2
+    assert read_model_params_in_ini(ini, "model-c") is None
+
+    # 修改已有值：原地替换，注释/其他节不变
+    out = update_model_params_in_ini(ini, "model-a", {"temp": 1.2, "ctx-size": 8192})
+    sec = out[out.index("[model-a]"):out.index("[model-b]")]
+    assert "temp = 1.2" in sec and "ctx-size = 8192" in sec, sec
+    assert "# keep me" in sec, sec
+    assert "reasoning-effort = high" in sec, sec
+    assert "sleep-idle-seconds = 600" in out, out
+    secb = out[out.index("[model-b"):]
+    assert "temp = 1.5" in secb and "model = /path/b.gguf" in secb, secb
+
+    # 插入新键：追加到节末尾，不影响后续节
+    out2 = update_model_params_in_ini(
+        ini, "model-b", {"reasoning-budget": 2048, "reasoning-effort": "low"})
+    secb2 = out2[out2.index("[model-b"):]
+    assert "reasoning-budget = 2048" in secb2 and "reasoning-effort = low" in secb2, secb2
+    # 插入后读回
+    p3 = read_model_params_in_ini(out2, "model-b")
+    assert p3["reasoning-budget"] == "2048" and p3["reasoning-effort"] == "low", p3
+
+    # 移除：None 或空串均删除该行
+    out3 = update_model_params_in_ini(ini, "model-a", {"reasoning-effort": None})
+    seca3 = out3[out3.index("[model-a]"):out3.index("[model-b]")]
+    assert "reasoning-effort" not in seca3, seca3
+    assert "# keep me" in seca3, seca3
+    out3b = update_model_params_in_ini(ini, "model-a", {"temp": ""})
+    seca3b = out3b[out3b.index("[model-a]"):out3b.index("[model-b]")]
+    assert "temp" not in seca3b, seca3b
+    # 移除不存在的键：不变
+    assert update_model_params_in_ini(ini, "model-a", {"reasoning-budget": None}) == ini
+
+    # 跨节不互相干扰：只改 model-b 的 temp 不影响 model-a
+    out4 = update_model_params_in_ini(ini, "model-b", {"temp": 0.3})
+    seca4 = out4[out4.index("[model-a]"):out4.index("[model-b]")]
+    assert "temp = 0.8" in seca4, seca4
+    assert "temp = 0.3" in out4[out4.index("[model-b]"):], out4
+
+    # 非法参数抛 ValueError
+    for bad in (
+        {"model": "/path/x.gguf"},          # 非白名单键
+        {"temp": 3.0}, {"temp": -0.1}, {"temp": "abc"}, {"temp": True},
+        {"ctx-size": 100}, {"ctx-size": 2**21}, {"ctx-size": 4096.5}, {"ctx-size": True},
+        {"reasoning-budget": -2}, {"reasoning-budget": 10.5}, {"reasoning-budget": True},
+        {"reasoning-effort": "ultra"}, {"reasoning-effort": 1},
+    ):
+        try:
+            update_model_params_in_ini(ini, "model-a", bad)
+            raise AssertionError(f"应抛 ValueError: {bad}")
+        except ValueError:
+            pass
+    # 节不存在抛 ValueError
+    try:
+        update_model_params_in_ini(ini, "nope", {"temp": 1.0})
+        raise AssertionError("节不存在应抛 ValueError")
+    except ValueError:
+        pass
+    print("model params ini 单测通过")
+
+
+def test_preset_model_routes():
+    """单测：GET/POST /api/preset/model/<id>（读取/写回/400/404）。"""
+    from llama_panel.app import create_app
+
+    tmp = os.path.join(HERE, "test_preset_model.ini")
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write("version = 1\n\n[*]\nsleep-idle-seconds = 600\n\n"
+                "[model-a]\ntemp = 0.8\nctx-size = 4096\n")
+    try:
+        app = create_app("http://127.0.0.1:9", ["fake"],
+                         log_path=os.path.join(HERE, "test_preset_model.log"),
+                         models_preset=tmp)
+        c = app.test_client()
+
+        # GET 成功
+        r = c.get("/api/preset/model/model-a")
+        assert r.status_code == 200, r.get_json()
+        d = r.get_json()
+        assert d["ok"] is True and d["model"] == "model-a", d
+        assert d["params"] == {"temp": "0.8", "ctx-size": "4096",
+                               "reasoning-budget": None, "reasoning-effort": None}, d
+        # GET 节不存在 → 404
+        r = c.get("/api/preset/model/nope")
+        assert r.status_code == 404, r.status_code
+
+        # POST 合法（restart False 不触发重启）→ 200，文件更新
+        r = c.post("/api/preset/model/model-a",
+                   json={"params": {"temp": 1.1, "reasoning-effort": "low"},
+                         "restart": False})
+        assert r.status_code == 200 and r.get_json()["ok"] is True, r.get_json()
+        with open(tmp, encoding="utf-8") as f:
+            content = f.read()
+        assert "temp = 1.1" in content and "reasoning-effort = low" in content, content
+        assert "sleep-idle-seconds = 600" in content, content
+
+        # POST 非法值 / 非法键 / 缺 params / 节不存在 → 400
+        for body in ({"params": {"temp": 5.0}},
+                     {"params": {"bogus": 1}},
+                     {"params": {"ctx-size": 100}},
+                     {}):
+            r = c.post("/api/preset/model/model-a", json=body)
+            assert r.status_code == 400 and r.get_json()["ok"] is False, (body, r.status_code)
+        r = c.post("/api/preset/model/nope", json={"params": {"temp": 1.0}})
+        assert r.status_code == 400, r.status_code
+    finally:
+        for f in (tmp, os.path.join(HERE, "test_preset_model.log")):
+            try:
+                os.remove(f)
+            except OSError:
+                pass
+
+    # 未配置 --models-preset → 400
+    app2 = create_app("http://127.0.0.1:9", ["fake"],
+                      log_path=os.path.join(HERE, "test_preset_model2.log"))
+    c2 = app2.test_client()
+    r = c2.get("/api/preset/model/model-a")
+    assert r.status_code == 400, r.status_code
+    r = c2.post("/api/preset/model/model-a", json={"params": {}})
+    assert r.status_code == 400, r.status_code
+    try:
+        os.remove(os.path.join(HERE, "test_preset_model2.log"))
+    except OSError:
+        pass
+    print("preset model 路由单测通过")
 
 
 def test_parse_power_profiles():
@@ -898,10 +1146,13 @@ def test_parse_slot_timings():
     print("C) slot timings parsing & enrichment unit tests passed")
 def main():
     test_gpu_parsers()
+    test_gpu_power_cap()
     test_parse_systemd_uptime()
     test_parse_model_state()
     test_parse_models_list()
     test_update_sleep_idle_in_ini()
+    test_model_params_ini()
+    test_preset_model_routes()
     test_parse_power_profiles()
     test_parse_slot_timings()
     test_preset_sleep_idle_e2e()
@@ -989,6 +1240,9 @@ def main():
 
         # 6c) 快捷对话试跑
         test_chat_ok()
+
+        # 6d) 快捷对话流式试跑（SSE）
+        test_chat_stream()
 
         # 7) 重启：先停后启，实际进程 pid 必须变化
         r = post("/api/server/restart")

@@ -4,6 +4,7 @@
 """
 from __future__ import annotations
 
+import glob
 import json
 import os
 import shutil
@@ -137,6 +138,77 @@ def _run(cmd: list[str]) -> str | None:
     return out.stdout.decode("utf-8", "replace")
 
 
+def _read_watts(path: str) -> int | None:
+    """读微瓦值文件并换算为整数瓦特；失败返回 None。"""
+    try:
+        with open(path) as f:
+            return int(int(f.read().strip()) / 1_000_000)
+    except (OSError, ValueError):
+        return None
+
+
+def _find_hwmon_dir(hwmon_dir: str | None = None) -> str | None:
+    """定位含 power1_cap/min/max 的 hwmon 目录。"""
+    if hwmon_dir is not None:
+        if all(os.path.isfile(os.path.join(hwmon_dir, k))
+               for k in ("power1_cap", "power1_cap_min", "power1_cap_max")):
+            return hwmon_dir
+        return None
+    for pattern in ("/sys/class/drm/card*/device/hwmon/hwmon*",):
+        for d in sorted(glob.glob(pattern)):
+            if not os.path.isdir(d):
+                continue
+            if all(os.path.isfile(os.path.join(d, k))
+                   for k in ("power1_cap", "power1_cap_min", "power1_cap_max")):
+                return d
+    return None
+
+
+def get_gpu_power_cap(hwmon_dir: str | None = None) -> dict | None:
+    """读取 GPU 硬件功耗墙（power1_cap）当前值与可写范围。
+
+    无可用 hwmon 时返回 None。
+    """
+    d = _find_hwmon_dir(hwmon_dir)
+    if d is None:
+        return None
+    cur = _read_watts(os.path.join(d, "power1_cap"))
+    mn = _read_watts(os.path.join(d, "power1_cap_min"))
+    mx = _read_watts(os.path.join(d, "power1_cap_max"))
+    if cur is None or mn is None or mx is None:
+        return None
+    cap_path = os.path.join(d, "power1_cap")
+    return {
+        "current_w": cur,
+        "min_w": mn,
+        "max_w": mx,
+        "default_w": _read_watts(os.path.join(d, "power1_cap_default")),
+        "writable": os.access(cap_path, os.W_OK),
+    }
+
+
+def set_gpu_power_cap(watts: int, hwmon_dir: str | None = None) -> dict:
+    """设置 GPU 硬件功耗墙（瓦特）。越界/非法/无权限返回 ok False。"""
+    if not isinstance(watts, int) or isinstance(watts, bool):
+        return {"ok": False, "error": "watts 须为整数"}
+    cap = get_gpu_power_cap(hwmon_dir)
+    if cap is None:
+        return {"ok": False, "error": "未找到可用的 GPU 功耗墙（power1_cap）"}
+    if not (cap["min_w"] <= watts <= cap["max_w"]):
+        return {"ok": False, "error":
+                f"watts 越界，允许范围 {cap['min_w']}..{cap['max_w']}"}
+    d = _find_hwmon_dir(hwmon_dir)
+    cap_path = os.path.join(d, "power1_cap")
+    if not os.access(cap_path, os.W_OK):
+        return {"ok": False, "error": "无权限写入 power1_cap"}
+    try:
+        with open(cap_path, "w") as f:
+            f.write(str(watts * 1_000_000))
+    except OSError as e:
+        return {"ok": False, "error": f"写入 power1_cap 失败: {e}"}
+    return {"ok": True, "watts": watts}
+
+
 def get_gpu_stats(runner=None) -> dict | None:
     """采集第一张 GPU 的只读状态；不可用时返回 None。
 
@@ -153,6 +225,7 @@ def get_gpu_stats(runner=None) -> dict | None:
             if text:
                 stats = parse_rocm_smi_json(text)
                 if stats:
+                    stats["power_cap"] = get_gpu_power_cap()
                     return stats
         text = run([
             "nvidia-smi",
@@ -161,7 +234,10 @@ def get_gpu_stats(runner=None) -> dict | None:
             "--format=csv,noheader,nounits",
         ])
         if text:
-            return parse_nvidia_smi_csv(text)
+            stats = parse_nvidia_smi_csv(text)
+            if stats:
+                stats["power_cap"] = get_gpu_power_cap()
+                return stats
     except Exception:
         return None
     return None

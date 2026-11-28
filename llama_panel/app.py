@@ -1,6 +1,7 @@
 """Flask 应用：llama.cpp 监控与控制面板 API。"""
 from __future__ import annotations
 
+import json
 import math
 import os
 import subprocess
@@ -10,11 +11,13 @@ from urllib.parse import urlparse
 
 import requests
 
-from flask import Flask, jsonify, request, send_from_directory
+from flask import Flask, Response, jsonify, request, send_from_directory
 
 from .client import LlamaClient, parse_model_state, parse_models_list, enrich_slots
-from .gpu import get_gpu_stats
-from .preset import update_sleep_idle_in_ini
+from .gpu import get_gpu_stats, set_gpu_power_cap
+from .preset import (
+    update_sleep_idle_in_ini, read_model_params_in_ini, update_model_params_in_ini,
+)
 from .power import PROFILES, get_power_status, set_power_profile
 from .process import ServerProcess, find_pid_on_port, kill_pid
 
@@ -394,6 +397,125 @@ def create_app(
             "predicted_per_second": timings.get("predicted_per_second"),
         })
 
+    @app.post("/api/chat/stream")
+    def api_chat_stream():
+        """快捷对话流式试跑：SSE 逐块推送 reasoning/content/done 事件。
+
+        body 同 /api/chat；空 prompt → 400。
+        上游非 text/event-stream（如 mock 普通 JSON）时解析完整响应，
+        一次性发出 content（+reasoning）后发 done。
+        """
+        data = request.get_json(silent=True)
+        if not isinstance(data, dict):
+            return jsonify({"ok": False, "error": "请求体须为 JSON 对象"}), 400
+        prompt = data.get("prompt")
+        if not isinstance(prompt, str) or not prompt.strip():
+            return jsonify({"ok": False, "error": "提示词不能为空"}), 400
+        model = data.get("model")
+        if not isinstance(model, str) or not model:
+            model = None
+        max_tokens = data.get("max_tokens", 512)
+        if isinstance(max_tokens, bool) or not isinstance(max_tokens, int):
+            try:
+                max_tokens = int(max_tokens)
+            except (TypeError, ValueError):
+                max_tokens = 512
+        max_tokens = max(16, min(max_tokens, 4096))
+        payload = {
+            "messages": [{"role": "user", "content": prompt.strip()}],
+            "max_tokens": max_tokens,
+            "stream": True,
+        }
+        if model:
+            payload["model"] = model
+
+        def sse(obj: dict) -> str:
+            return "data: " + json.dumps(obj, ensure_ascii=False) + "\n\n"
+
+        def generate():
+            start = time.monotonic()
+            timings: dict = {}
+            try:
+                r = requests.post(
+                    server_url.rstrip("/") + "/v1/chat/completions",
+                    json=payload, stream=True, timeout=120,
+                )
+                if r.status_code != 200:
+                    yield sse({"type": "error", "error": f"上游返回 HTTP {r.status_code}"})
+                    return
+                r.encoding = "utf-8"
+                ctype = r.headers.get("Content-Type", "")
+                if "text/event-stream" not in ctype:
+                    # 兼容上游返回普通非流式 JSON 的 mock：一次性发 content + done
+                    try:
+                        body = r.json()
+                    except ValueError:
+                        yield sse({"type": "error", "error": "响应不是合法 JSON"})
+                        return
+                    if not isinstance(body, dict):
+                        yield sse({"type": "error", "error": "响应不是合法 JSON"})
+                        return
+                    content = ""
+                    reasoning = ""
+                    choices = body.get("choices")
+                    if isinstance(choices, list) and choices and isinstance(choices[0], dict):
+                        msg = choices[0].get("message")
+                        if isinstance(msg, dict):
+                            c = msg.get("content")
+                            content = c if isinstance(c, str) else ""
+                            rz = msg.get("reasoning_content")
+                            reasoning = rz if isinstance(rz, str) else ""
+                    t = body.get("timings")
+                    if isinstance(t, dict):
+                        timings = t
+                    if reasoning:
+                        yield sse({"type": "reasoning", "delta": reasoning})
+                    if content:
+                        yield sse({"type": "content", "delta": content})
+                else:
+                    for raw in r.iter_lines(decode_unicode=False):
+                        line = raw.decode("utf-8", errors="replace")
+                        if not line or not line.startswith("data:"):
+                            continue
+                        data_str = line[5:].strip()
+                        if data_str == "[DONE]":
+                            break
+                        try:
+                            obj = json.loads(data_str)
+                        except ValueError:
+                            continue
+                        if not isinstance(obj, dict):
+                            continue
+                        choices = obj.get("choices")
+                        if isinstance(choices, list) and choices and isinstance(choices[0], dict):
+                            delta = choices[0].get("delta")
+                            if isinstance(delta, dict):
+                                rz = delta.get("reasoning_content")
+                                if isinstance(rz, str):
+                                    yield sse({"type": "reasoning", "delta": rz})
+                                c = delta.get("content")
+                                if isinstance(c, str):
+                                    yield sse({"type": "content", "delta": c})
+                        t = obj.get("timings")
+                        if isinstance(t, dict):
+                            timings = t
+                dt = time.monotonic() - start
+                yield sse({
+                    "type": "done",
+                    "elapsed_s": round(dt, 2),
+                    "prompt_n": timings.get("prompt_n"),
+                    "predicted_n": timings.get("predicted_n"),
+                    "prompt_per_second": timings.get("prompt_per_second"),
+                    "predicted_per_second": timings.get("predicted_per_second"),
+                })
+            except requests.RequestException as e:
+                yield sse({"type": "error", "error": f"请求失败: {e}"})
+
+        resp = Response(generate(), mimetype="text/event-stream; charset=utf-8")
+        resp.headers["Cache-Control"] = "no-cache"
+        resp.headers["X-Accel-Buffering"] = "no"
+        return resp
+
     @app.post("/api/server/start")
     def api_server_start():
         if svc is not None:
@@ -522,6 +644,101 @@ def create_app(
             if restarted:
                 slot_timing_cache.clear()
         return jsonify(result)
+
+    @app.get("/api/preset/model/<path:model_id>")
+    def api_preset_model_get(model_id):
+        """读取 models.ini 中指定模型节的当前参数（白名单 4 键）。"""
+        if not models_preset:
+            return jsonify({"ok": False, "error": "未配置 models 预设文件（--models-preset）"}), 400
+        if not os.path.exists(models_preset):
+            return jsonify({"ok": False, "error": f"预设文件不存在: {models_preset}"}), 404
+        try:
+            with open(models_preset, "r", encoding="utf-8") as f:
+                text = f.read()
+        except OSError as e:
+            return jsonify({"ok": False, "error": f"读取预设文件失败: {e}"}), 500
+        params = read_model_params_in_ini(text, model_id)
+        if params is None:
+            return jsonify({"ok": False, "error": f"预设文件中不存在 [{model_id}] 节"}), 404
+        return jsonify({"ok": True, "model": model_id, "params": params})
+
+    @app.post("/api/preset/model/<path:model_id>")
+    def api_preset_model_post(model_id):
+        """在线微调 models.ini 中指定模型的参数并（可选）重启服务。
+
+        body: {"params": {"temp"?, "ctx-size"?, "reasoning-budget"?, "reasoning-effort"?},
+               "restart": bool (默认 True)}
+        - 未配置 --models-preset → 400；预设文件不存在 → 404；
+        - 节不存在 / 非法键 / 值越界 → 400；
+        - restart 为 True 时清空槽位速度缓存与空闲追踪状态并重启服务。
+        """
+        nonlocal idle_track_model, last_token_total
+        if not models_preset:
+            return jsonify({"ok": False, "error": "未配置 models 预设文件（--models-preset）"}), 400
+        if not os.path.exists(models_preset):
+            return jsonify({"ok": False, "error": f"预设文件不存在: {models_preset}"}), 404
+        data = request.get_json(silent=True)
+        if not isinstance(data, dict):
+            return jsonify({"ok": False, "error": "请求体须为 JSON 对象"}), 400
+        params = data.get("params")
+        if not isinstance(params, dict):
+            return jsonify({"ok": False, "error": "params 须为 JSON 对象"}), 400
+        restart = bool(data.get("restart", True))
+        try:
+            with open(models_preset, "r", encoding="utf-8") as f:
+                text = f.read()
+        except OSError as e:
+            return jsonify({"ok": False, "error": f"读取预设文件失败: {e}"}), 500
+        try:
+            new_text = update_model_params_in_ini(text, model_id, params)
+        except ValueError as e:
+            return jsonify({"ok": False, "error": str(e)}), 400
+        try:
+            with open(models_preset, "w", encoding="utf-8") as f:
+                f.write(new_text)
+        except OSError as e:
+            return jsonify({"ok": False, "error": f"写入预设文件失败: {e}"}), 500
+        result = {"ok": True, "model": model_id}
+        if restart:
+            try:
+                if svc is not None:
+                    svc.restart()
+                    result["restarted"] = True
+                elif proc.is_running():
+                    proc.stop()
+                    proc.start()
+                    result["restarted"] = True
+                else:
+                    ext = _external_pid()
+                    if ext is not None:
+                        kill_pid(ext)
+                        result["restarted"] = True
+                    else:
+                        result["restarted"] = False
+            except (RuntimeError, OSError) as e:
+                return jsonify({"ok": False, "error": f"重启失败: {e}"}), 500
+            if result["restarted"]:
+                slot_timing_cache.clear()
+                with model_lock:
+                    idle_track_model = None
+                    last_token_total = None
+        return jsonify(result)
+
+    @app.post("/api/gpu/power-cap")
+    def api_gpu_power_cap():
+        """设置 GPU 硬件功耗墙。body: {"watts": int}"""
+        data = request.get_json(silent=True)
+        watts = data.get("watts") if isinstance(data, dict) else None
+        if not isinstance(watts, int) or isinstance(watts, bool):
+            return jsonify({"ok": False, "error": "watts 须为整数"}), 400
+        res = set_gpu_power_cap(watts)
+        if res.get("ok"):
+            return jsonify({"ok": True, "watts": watts}), 200
+        # 越界/非法 → 400；不可用/权限不足 → 500
+        err = res.get("error", "")
+        if "越界" in err or "整数" in err:
+            return jsonify(res), 400
+        return jsonify(res), 500
 
     @app.post("/api/power/profile")
     def api_power_profile():
